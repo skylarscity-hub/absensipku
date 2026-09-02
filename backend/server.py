@@ -22,6 +22,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 
 ROOT_DIR = Path(__file__).parent
@@ -329,7 +334,12 @@ async def create_session(payload: SessionRequest) -> SessionResponse:
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     bootstrap_email = os.getenv("PKUCITY_ADMIN_EMAIL", "").strip().lower()
     existing = await db.users.find_one({"email": email}, {"_id": 0})
-    role = existing.get("role", "employee") if existing else ("admin" if email.lower() == bootstrap_email else "employee")
+    # Bootstrap admin ALWAYS gets/keeps admin role on every login (even if the doc
+    # was previously stored as employee). Everyone else keeps their existing role.
+    if bootstrap_email and email.lower() == bootstrap_email:
+        role = "admin"
+    else:
+        role = existing.get("role", "employee") if existing else "employee"
     user_doc = {
         "user_id": existing.get("user_id", user_id) if existing else user_id,
         "email": email,
@@ -815,11 +825,95 @@ async def admin_reports_export(request: Request, date_from: Optional[str] = None
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-    csv_data = buffer.getvalue()
-    filename = f"pkucity-attendance-{date_from}-to-{date_to}.csv"
+
+
+@api_router.get("/admin/reports/export.pdf")
+async def admin_reports_export_pdf(request: Request, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Response:
+    today = now_utc().strftime("%Y-%m-%d")
+    first_of_month = now_utc().replace(day=1).strftime("%Y-%m-%d")
+    date_from = _parse_date(date_from, first_of_month)
+    date_to = _parse_date(date_to, today)
+    rows = await _report_rows(request, date_from, date_to)
+    schedule = await get_schedule()
+    ch, cm = [int(part) for part in schedule["check_out"].split(":")]
+    grace = int(schedule.get("grace_minutes", 0))
+    scheduled_end_minutes = ch * 60 + cm + grace
+
+    # Aggregate per user with overtime.
+    summary: Dict[str, Dict[str, Any]] = {}
+    latest_checkout: Dict[str, Dict[str, datetime]] = {}
+    for row in rows:
+        key = row.get("user_id") or "unknown"
+        bucket = summary.setdefault(key, {
+            "name": row.get("user_name") or row.get("user_email") or key,
+            "email": row.get("user_email") or "",
+            "department": row.get("department") or "",
+            "check_ins": 0,
+            "check_outs": 0,
+            "overtime_minutes": 0,
+        })
+        if row.get("action") == "check_in":
+            bucket["check_ins"] += 1
+        elif row.get("action") == "check_out":
+            bucket["check_outs"] += 1
+            created_at = row.get("created_at")
+            date_str = row.get("date")
+            if isinstance(created_at, datetime) and date_str:
+                per_day = latest_checkout.setdefault(key, {})
+                if date_str not in per_day or created_at > per_day[date_str]:
+                    per_day[date_str] = created_at
+    for user_id, dates in latest_checkout.items():
+        total = 0
+        for _, dt in dates.items():
+            diff = (dt.hour * 60 + dt.minute) - scheduled_end_minutes
+            if diff > 0:
+                total += diff
+        summary[user_id]["overtime_minutes"] = total
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm)
+    styles = getSampleStyleSheet()
+    title_style = styles["Heading1"]
+    title_style.textColor = colors.HexColor("#DC2626")
+    body: List[Any] = []
+    body.append(Paragraph("PKUCity Attendance Summary", title_style))
+    body.append(Paragraph(f"Period: {date_from} → {date_to}", styles["Normal"]))
+    body.append(Paragraph(f"Scheduled check-out: {schedule['check_out']} (+{grace} min grace) · {len(rows)} raw records · {len(summary)} employees", styles["Normal"]))
+    body.append(Spacer(1, 8 * mm))
+
+    table_data = [["Name", "Department", "Email", "Check-ins", "Check-outs", "Overtime"]]
+    for user_id, bucket in summary.items():
+        overtime_min = int(bucket.get("overtime_minutes", 0))
+        overtime_label = f"{overtime_min // 60}h {overtime_min % 60}m" if overtime_min > 0 else "—"
+        table_data.append([
+            bucket["name"], bucket["department"], bucket["email"],
+            str(bucket["check_ins"]), str(bucket["check_outs"]), overtime_label,
+        ])
+    if len(table_data) == 1:
+        table_data.append(["No attendance records in range", "", "", "", "", ""])
+    table = Table(table_data, hAlign="LEFT", colWidths=[35 * mm, 30 * mm, 55 * mm, 20 * mm, 20 * mm, 20 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DC2626")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FEF2F2")]),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#F3F4F6")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    body.append(table)
+    body.append(Spacer(1, 6 * mm))
+    body.append(Paragraph("Generated by PKUCity · confidential", styles["Italic"]))
+    doc.build(body)
+    pdf_bytes = buffer.getvalue()
+    filename = f"pkucity-attendance-{date_from}-to-{date_to}.pdf"
     return Response(
-        content=csv_data,
-        media_type="text/csv; charset=utf-8",
+        content=pdf_bytes,
+        media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

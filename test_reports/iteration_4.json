@@ -1,0 +1,47 @@
+{
+  "summary": "Backend-only iteration. Wrote /app/backend/tests/test_backend_api.py covering the P0 admin-email bootstrap fix, PDF export auth+content contract, overtime calculation, CSV Department column, attendance persistence of full_name/department, and admin overview shape+RBAC. All 14 tests pass (13 new + 1 existing regression) against http://localhost:8001. Emergent Google OAuth cannot be minted, so authenticated flows are exercised by seeding users + user_sessions directly via motor (test_database) with Bearer tokens, and create_session is unit-tested by monkeypatching httpx.AsyncClient. P0 fix verified: an existing users doc with role='employee' for skylarscity@gmail.com is promoted back to 'admin' on create_session, and stays admin on repeat login. Overtime: seeded check_out at 18:30 UTC with schedule 17:00 +15m grace returned overtime_minutes=75 as expected. PDF starts with %PDF, Content-Type application/pdf, Content-Disposition attachment; summary payload used by the PDF exposes name/email/department/check_ins/check_outs/overtime_minutes for the seeded user. CSV export includes 'Department' column and populated 75 overtime for the check_out row.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/admin/reports", "issue": "Overtime computed from created_at UTC hours/minutes but scheduled check_out is a bare HH:MM (implicitly local business time). If the deployed timezone differs from the schedule timezone, overtime will be off by the UTC offset. Test uses UTC values so it passes; document/normalize."},
+      {"endpoint": "POST /api/liveness/verify", "issue": "Unauthenticated bodyless request returns 422 (multipart validation runs before auth). Prior iteration_3 finding, unchanged."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_backend_api.py",
+    "/app/backend/tests/test_api_regression.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/iteration_4.json"
+  ],
+  "action_items": [
+    "Consider migrating FastAPI @app.on_event('startup'/'shutdown') to lifespan handlers (DeprecationWarning noted on server.py:294 and :925).",
+    "Clarify/normalize the timezone used for schedule.check_out vs. attendance.created_at (currently mixes UTC-derived minute-of-day with local HH:MM string); today it happens to work in UTC.",
+    "For POST /api/liveness/verify, consider evaluating auth before multipart validation so unauthenticated requests return 401 instead of 422 (carried over from iteration_3).",
+    "Frontend .env uses EXPO_PUBLIC_BACKEND_URL while system prompt references EXPO_BACKEND_URL; align the naming to avoid deploy drift (carried over)."
+  ],
+  "critical_code_review_comments": [
+    "create_session correctly forces role='admin' whenever the incoming email matches PKUCITY_ADMIN_EMAIL, and preserves existing role for other users (verified by unit + integration seed). Good.",
+    "PDF export uses ReportLab compressed content stream; if any future contract requires text-scanning the PDF, disable compression on SimpleDocTemplate or read via pypdf.",
+    "server.py is ~928 lines and mixes auth, liveness (heavy mediapipe/cv2), reports, and admin endpoints. Above the 700-line guideline; recommend splitting into routers/services (auth, attendance, admin, reports, liveness) for maintainability.",
+    "attendance record now correctly persists user_name (from user.full_name) and department at write time — matches the new CSV Department column."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_backend_api.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/iteration_4.json"
+  ],
+  "success_rate": {"backend": "100% (14/14 pytest cases pass)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Per-test motor fixtures create TEST_-prefixed users, user_sessions, and attendance docs and clean them up on teardown. The bootstrap-admin test upserts skylarscity@gmail.com with role=employee, then verifies create_session restores role=admin; the record is left in admin state (correct production state).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run tests with: cd /app/backend && EXPO_PUBLIC_BACKEND_URL=http://localhost:8001 python -m pytest tests/ -v -n 0. pytest.ini defaults to -n 2 --dist loadscope; the seeded_attendance fixture mutates the global schedule doc and restores it, so pass -n 0 (or keep loadscope) to avoid cross-worker races. Motor's AsyncIOMotorClient binds to the running event loop; the db fixture rebinds server.client/server.db per test so direct calls into server.create_session work under pytest-asyncio's per-test loop. Real Emergent Google OAuth session_id was NOT provided, so create_session is only exercised via httpx.AsyncClient monkeypatch — end-to-end Google flow still requires a real approved Google account.",
+  "rca_of_issue": "Original P0: create_session previously honored the existing users.role for the bootstrap admin email, so once the doc was written with role='employee' (e.g., from a pre-fix login), later logins kept it as employee. Fix at server.py:339-342 always overrides role to 'admin' when incoming email equals PKUCITY_ADMIN_EMAIL. Verified by seeding role='employee' for that email and asserting resp.user.role=='admin' plus persisted users.role=='admin' after one and two calls to create_session."
+}

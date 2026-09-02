@@ -6,6 +6,9 @@ import * as Location from "expo-location";
 import * as SecureStore from "expo-secure-store";
 import * as WebBrowser from "expo-web-browser";
 import { BlurView } from "expo-blur";
+import * as FileSystem from "expo-file-system/legacy";
+import * as Sharing from "expo-sharing";
+import MapPicker from "@/src/components/MapPicker";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -145,9 +148,22 @@ function HomeScreen({ dashboard, onRefresh, onOpenCapture }: { dashboard: Dashbo
   const nearestOffice = offices.find((o) => o.office_name === nearestName) || offices[0];
   const inRange = distance !== null && nearestOffice ? distance <= nearestOffice.radius_meters : false;
   const holiday = dashboard?.holiday;
+  // Compute lateness if today has a check-in record past scheduled check_in + grace
+  const scheduledCheckIn = dashboard?.schedule.check_in || "08:00";
+  const graceMinutes = dashboard?.schedule.grace_minutes ?? 0;
+  const todayRecord = dashboard?.today;
+  let lateMinutes = 0;
+  if (todayRecord?.action === "check_in" && todayRecord.created_at) {
+    const created = new Date(todayRecord.created_at);
+    const [ch, cm] = scheduledCheckIn.split(":").map(Number);
+    const scheduledStart = ch * 60 + cm + graceMinutes;
+    const actualStart = created.getHours() * 60 + created.getMinutes();
+    if (actualStart > scheduledStart) lateMinutes = actualStart - scheduledStart;
+  }
   return <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 32 }]} showsVerticalScrollIndicator={false}>
     <View style={styles.headerRow}><View><Text style={styles.greeting}>Good day</Text><Text style={styles.heading}>{dashboard?.user.name || "Your workspace"}</Text></View><View style={styles.avatar}><Text style={styles.avatarText}>{initials(dashboard?.user.name || "PK")}</Text></View></View>
     {!!holiday && <View testID="holiday-banner" style={styles.holidayBanner}><Ionicons name="sparkles" size={18} color="#B45309" /><Text style={styles.holidayText}>Today is a holiday · {holiday.label}. Attendance is optional.</Text></View>}
+    {lateMinutes > 0 && <View testID="late-banner" style={styles.lateBanner}><Ionicons name="time-outline" size={18} color="#B91C1C" /><Text style={styles.lateText}>You checked in {lateMinutes} min after the scheduled {scheduledCheckIn}. Try to arrive on time tomorrow.</Text></View>}
     <View style={styles.liveCard}><View style={styles.cardTop}><View><Text style={styles.cardKicker}>TODAY’S ATTENDANCE</Text><Text style={styles.cardTitle}>{completed ? `Checked ${completed === "check_in" ? "in" : "out"}` : "Ready when you are"}</Text></View><StatusPill label={completed ? "Recorded" : "Not started"} tone={completed ? "success" : "neutral"} /></View><View style={styles.rule} /><View style={styles.scheduleRow}><View><Text style={styles.miniLabel}>SHIFT</Text><Text style={styles.scheduleValue}>{dashboard?.schedule.check_in || "08:00"} — {dashboard?.schedule.check_out || "17:00"}</Text></View><View style={styles.scheduleDivider} /><View><Text style={styles.miniLabel}>NEAREST OFFICE</Text><Text style={styles.scheduleValue}>{nearestOffice?.office_name || "—"}</Text></View></View></View>
     <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>Verification</Text><Pressable onPress={onRefresh} hitSlop={8}><Ionicons name="refresh" size={20} color="#DC2626" /></Pressable></View>
     <View style={styles.verifyCard}><View style={styles.verifyIcon}><Ionicons name="location" size={21} color="#DC2626" /></View><View style={styles.verifyCopy}><Text style={styles.verifyTitle}>Office location</Text><Text style={styles.verifySub}>{locating ? locationState : distance === null ? locationState : `${distance}m away · ${locationState}`}</Text></View>{locating ? <ActivityIndicator color="#DC2626" /> : <Ionicons name={inRange ? "checkmark-circle" : "alert-circle"} size={22} color={inRange ? "#16A34A" : "#CA8A04"} />}</View>
@@ -412,7 +428,13 @@ function OfficesTab({ token, overview, onChange, onMessage }: { token: string; o
     ))}
     <View style={styles.formCard}>
       <Text style={styles.formTitle}>Add another office</Text>
-      <Text style={styles.formHint}>Employees can check in near any active office.</Text>
+      <Text style={styles.formHint}>Tap the map to drop the pin or type coordinates below.</Text>
+      <MapPicker
+        latitude={form.latitude ? Number(form.latitude) : null}
+        longitude={form.longitude ? Number(form.longitude) : null}
+        radius={Number(form.radius_meters) || 100}
+        onChange={(lat, lng) => setForm((prev) => ({ ...prev, latitude: lat.toFixed(6), longitude: lng.toFixed(6) }))}
+      />
       <Field label="Office name" value={form.office_name} onChangeText={(v) => setForm({ ...form, office_name: v })} />
       <Field label="Latitude" value={form.latitude} onChangeText={(v) => setForm({ ...form, latitude: v })} keyboardType="numeric" />
       <Field label="Longitude" value={form.longitude} onChangeText={(v) => setForm({ ...form, longitude: v })} keyboardType="numeric" />
@@ -572,6 +594,32 @@ function ReportsTab({ token }: { token: string }) {
       setError(err instanceof Error ? err.message : "Could not share CSV");
     }
   };
+  const sharePdf = async () => {
+    try {
+      setError("");
+      if (Platform.OS === "web") {
+        // Web: download via fetch + blob URL.
+        const response = await fetch(apiUrl(`/admin/reports/export.pdf?date_from=${dateFrom}&date_to=${dateTo}`), { headers: { Authorization: `Bearer ${token}` } });
+        if (!response.ok) throw new Error("Could not build PDF");
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const link = window.document.createElement("a");
+        link.href = url;
+        link.download = `pkucity-attendance-${dateFrom}-to-${dateTo}.pdf`;
+        link.click();
+        window.URL.revokeObjectURL(url);
+        return;
+      }
+      const target = `${FileSystem.cacheDirectory}pkucity-attendance-${dateFrom}-to-${dateTo}.pdf`;
+      const download = await FileSystem.downloadAsync(apiUrl(`/admin/reports/export.pdf?date_from=${dateFrom}&date_to=${dateTo}`), target, { headers: { Authorization: `Bearer ${token}` } });
+      if (download.status !== 200) throw new Error("Could not build PDF");
+      const available = await Sharing.isAvailableAsync();
+      if (!available) { setError("Sharing is not available on this device."); return; }
+      await Sharing.shareAsync(download.uri, { mimeType: "application/pdf", dialogTitle: `PKUCity attendance ${dateFrom} → ${dateTo}` });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not share PDF");
+    }
+  };
   return <View>
     <View style={styles.formCard}>
       <Text style={styles.formTitle}>Attendance report</Text>
@@ -586,6 +634,9 @@ function ReportsTab({ token }: { token: string }) {
           <Ionicons name="share-outline" size={18} color="#fff" /><Text style={styles.primaryButtonText}>Share CSV</Text>
         </Pressable>
       </View>
+      <Pressable testID="report-share-pdf-button" onPress={sharePdf} disabled={loading} style={[styles.primaryButton, { marginTop: 10 }]}>
+        <Ionicons name="document-text-outline" size={18} color="#fff" /><Text style={styles.primaryButtonText}>Share monthly PDF</Text>
+      </Pressable>
       {!!error && <Text style={styles.captureNoticeError}>{error}</Text>}
       {report && <Text style={styles.formHint}>{report.total_rows} records · {report.summary.length} employees · overtime after {report.schedule?.check_out || "17:00"} (+{report.schedule?.grace_minutes ?? 0}m grace)</Text>}
     </View>
@@ -803,4 +854,11 @@ const styles = StyleSheet.create({
   reportMetric: { color: "#111827", fontSize: 14, fontWeight: "800" },
   reportMetricMuted: { color: "#6B7280", fontSize: 12, marginTop: 2 },
   overtimeText: { color: "#B45309", fontSize: 11, fontWeight: "700", marginTop: 4 },
+  lateBanner: { backgroundColor: "#FEF2F2", borderRadius: 12, padding: 12, flexDirection: "row", gap: 8, alignItems: "center", marginBottom: 16, borderWidth: 1, borderColor: "#FCA5A5" },
+  lateText: { color: "#991B1B", fontSize: 12, flex: 1, fontWeight: "700" },
+  mapContainer: { marginBottom: 15 },
+  mapView: { height: 220, borderRadius: 14, overflow: "hidden" },
+  mapHint: { color: "#6B7280", fontSize: 12, marginTop: 8, textAlign: "center" },
+  mapNotice: { backgroundColor: "#FEF2F2", padding: 16, borderRadius: 14, alignItems: "center", gap: 8, marginBottom: 15 },
+  mapNoticeText: { color: "#991B1B", fontSize: 12, textAlign: "center", lineHeight: 18 },
 });

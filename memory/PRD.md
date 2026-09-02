@@ -37,6 +37,10 @@ Build a mobile attendance app where employees sign in with verified Google accou
 - **Onboarding**: new users are forced to complete `full_name` + `department` on first sign-in (`PATCH /api/profile`, gated by `profile_complete` flag).
 - **Admin Users tab**: admin can list all users (`GET /api/admin/users`) and edit any user's full name and department (`PATCH /api/admin/users/{id}`).
 - **Overtime**: reports calculate overtime minutes per user (latest check-out per day minus scheduled `check_out + grace_minutes`). Shown in the Reports card and included as an "Overtime (min)" column in the CSV export.
+- **[P0 BUG FIX]** `create_session` now always forces role=admin for the bootstrap email `PKUCITY_ADMIN_EMAIL` even if an existing user doc has role=employee (previously stuck as employee). Verified by testing agent 14/14 pytest cases (`/app/test_reports/iteration_4.json`).
+- **Map picker**: Added `src/components/MapPicker.tsx` (native) and `.web.tsx` fallback. Admin dropping/dragging a pin on Google/Apple Maps auto-fills lat/lng in the office form. Requires `react-native-maps`.
+- **Monthly PDF report**: `GET /api/admin/reports/export.pdf` returns a one-page A4 PDF (via `reportlab`) with title, period, and per-employee table including overtime. Frontend downloads and shares via `expo-file-system` + `expo-sharing`.
+- **Late banner**: Home shows a red "You checked in N min after the scheduled HH:MM" banner if today's check-in is past `check_in + grace_minutes`.
 
 ## Backlog
 - P1: Add employee roster / teams; per-team schedules; PDF export.
