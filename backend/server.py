@@ -2,14 +2,24 @@ from datetime import datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+import csv
+import hashlib
+import io
 import logging
 import os
+import secrets
+import shutil
+import tempfile
 import uuid
 
+import cv2
 import httpx
+import mediapipe as mp
+import numpy as np
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
@@ -58,15 +68,28 @@ class AttendanceCreate(BaseModel):
     action: Literal["check_in", "check_out"]
     latitude: float
     longitude: float
-    face_verified: bool
-    liveness_signal: str = Field(min_length=4, max_length=80)
+    liveness_session_id: str = Field(min_length=12, max_length=120)
 
 
-class SettingsUpdate(BaseModel):
-    office_name: Optional[str] = None
+class OfficeCreate(BaseModel):
+    office_name: str = Field(min_length=1, max_length=120)
+    latitude: float
+    longitude: float
+    radius_meters: int = Field(default=100, ge=25, le=5000)
+    active: bool = True
+
+
+class OfficeUpdate(BaseModel):
+    office_name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    radius_meters: Optional[int] = Field(default=None, ge=50, le=5000)
+    radius_meters: Optional[int] = Field(default=None, ge=25, le=5000)
+    active: Optional[bool] = None
+
+
+class HolidayCreate(BaseModel):
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    label: str = Field(min_length=1, max_length=120)
 
 
 class ScheduleUpdate(BaseModel):
@@ -102,20 +125,47 @@ async def require_admin(request: Request) -> Dict[str, Any]:
     return user
 
 
-async def get_settings() -> Dict[str, Any]:
-    settings = await db.settings.find_one({"settings_id": "primary"}, {"_id": 0})
-    if settings:
-        return clean(settings)
-    settings = {
-        "settings_id": "primary",
-        "office_name": "PKUCity Office",
-        "latitude": -6.200000,
-        "longitude": 106.816666,
-        "radius_meters": 150,
+async def ensure_default_office() -> None:
+    """Bootstrap first active office if none exists (migrates legacy settings.primary too)."""
+    if await db.offices.count_documents({}) > 0:
+        return
+    legacy = await db.settings.find_one({"settings_id": "primary"}, {"_id": 0})
+    office = {
+        "office_id": f"off_{uuid.uuid4().hex[:12]}",
+        "office_name": (legacy or {}).get("office_name", "PKUCity Office"),
+        "latitude": (legacy or {}).get("latitude", -6.200000),
+        "longitude": (legacy or {}).get("longitude", 106.816666),
+        "radius_meters": (legacy or {}).get("radius_meters", 100),
+        "active": True,
+        "created_at": now_utc(),
         "updated_at": now_utc(),
     }
-    await db.settings.insert_one(dict(settings))
-    return settings
+    await db.offices.insert_one(dict(office))
+
+
+async def list_offices(active_only: bool = False) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {}
+    if active_only:
+        query["active"] = True
+    docs = await db.offices.find(query, {"_id": 0}).sort("created_at", 1).to_list(200)
+    return [clean(item) for item in docs]
+
+
+async def get_schedule() -> Dict[str, Any]:
+    schedule = await db.schedule.find_one({"schedule_id": "weekly"}, {"_id": 0})
+    return clean(schedule) or {"schedule_id": "weekly", "check_in": "08:00", "check_out": "17:00", "grace_minutes": 15}
+
+
+async def list_holidays(upcoming_only: bool = False) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {}
+    if upcoming_only:
+        query["date"] = {"$gte": now_utc().strftime("%Y-%m-%d")}
+    docs = await db.holidays.find(query, {"_id": 0}).sort("date", 1).to_list(500)
+    return [clean(item) for item in docs]
+
+
+async def is_holiday(date_str: str) -> Optional[Dict[str, Any]]:
+    return await db.holidays.find_one({"date": date_str}, {"_id": 0})
 
 
 def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -126,14 +176,113 @@ def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     return earth_radius * 2 * asin(sqrt(a))
 
 
+def nearest_office(offices: List[Dict[str, Any]], lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    best: Optional[Dict[str, Any]] = None
+    best_dist = float("inf")
+    for office in offices:
+        d = distance_meters(lat, lon, office["latitude"], office["longitude"])
+        if d < best_dist:
+            best_dist = d
+            best = {**office, "distance_meters": round(d)}
+    return best
+
+
+LIVENESS_CHALLENGES = ("blink", "turn_left", "turn_right")
+LIVENESS_MODEL_PATH = ROOT_DIR / "models" / "face_landmarker.task"
+
+
+def eye_aspect_ratio(points: List[Any], indexes: List[int]) -> float:
+    left, top_left, bottom_left, right, top_right, bottom_right = [points[index] for index in indexes]
+    horizontal = max(float(np.linalg.norm(np.array([left.x, left.y]) - np.array([right.x, right.y]))), 1e-6)
+    vertical_a = np.linalg.norm(np.array([top_left.x, top_left.y]) - np.array([bottom_left.x, bottom_left.y]))
+    vertical_b = np.linalg.norm(np.array([top_right.x, top_right.y]) - np.array([bottom_right.x, bottom_right.y]))
+    return float((vertical_a + vertical_b) / (2 * horizontal))
+
+
+def analyze_liveness(video_path: str, expected: List[str]) -> Dict[str, Any]:
+    if not LIVENESS_MODEL_PATH.exists():
+        return {"passed": False, "reason": "liveness_model_unavailable", "events": [], "face_frames": 0}
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        return {"passed": False, "reason": "invalid_video", "events": [], "face_frames": 0}
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    sample_every = max(1, int(fps / 15))
+    frame_index = 0
+    sampled_frames = 0
+    face_frames = 0
+    samples: List[Dict[str, float]] = []
+    options = mp.tasks.vision.FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(LIVENESS_MODEL_PATH)),
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.6,
+        min_face_presence_confidence=0.6,
+        min_tracking_confidence=0.6,
+    )
+    try:
+        with mp.tasks.vision.FaceLandmarker.create_from_options(options) as detector:
+            while frame_index <= int(fps * 12):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if frame_index % sample_every == 0:
+                    sampled_frames += 1
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    result = detector.detect_for_video(image, int(frame_index * 1000 / fps))
+                    if len(result.face_landmarks) == 1:
+                        landmarks = result.face_landmarks[0]
+                        left_ear = eye_aspect_ratio(landmarks, [33, 160, 144, 133, 158, 153])
+                        right_ear = eye_aspect_ratio(landmarks, [362, 385, 380, 263, 387, 373])
+                        nose = landmarks[1].x
+                        cheek_center = (landmarks[234].x + landmarks[454].x) / 2
+                        cheek_width = max(abs(landmarks[454].x - landmarks[234].x), 1e-5)
+                        samples.append({"ear": (left_ear + right_ear) / 2, "yaw": (nose - cheek_center) / cheek_width})
+                        face_frames += 1
+                frame_index += 1
+    except Exception as exc:
+        logger.exception("Liveness analysis failed: %s", exc)
+        return {"passed": False, "reason": "analysis_error", "events": [], "face_frames": face_frames}
+    finally:
+        capture.release()
+
+    if len(samples) < 20 or sampled_frames == 0 or face_frames / sampled_frames < 0.65:
+        return {"passed": False, "reason": "face_not_consistently_visible", "events": [], "face_frames": face_frames}
+    events: List[str] = []
+    blink_armed = False
+    last_turn = ""
+    for sample in samples:
+        if sample["ear"] > 0.27:
+            blink_armed = True
+        if blink_armed and sample["ear"] < 0.20:
+            events.append("blink")
+            blink_armed = False
+        turn = "turn_left" if sample["yaw"] < -0.09 else "turn_right" if sample["yaw"] > 0.09 else ""
+        if turn and turn != last_turn:
+            events.append(turn)
+            last_turn = turn
+        if not turn:
+            last_turn = ""
+    cursor = 0
+    for event in events:
+        if cursor < len(expected) and event == expected[cursor]:
+            cursor += 1
+    passed = cursor == len(expected)
+    return {"passed": passed, "reason": None if passed else "challenge_failed", "events": events, "face_frames": face_frames}
+
+
 @app.on_event("startup")
 async def startup() -> None:
     await db.users.create_index("email", unique=True)
     await db.users.create_index("user_id", unique=True)
     await db.user_sessions.create_index("session_token", unique=True)
     await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
+    await db.liveness_sessions.create_index("expires_at", expireAfterSeconds=0)
+    await db.liveness_results.create_index("liveness_session_id", unique=True)
     await db.admin_requests.create_index("request_id", unique=True)
-    await get_settings()
+    await db.offices.create_index("office_id", unique=True)
+    await db.holidays.create_index("date", unique=True)
+    await ensure_default_office()
 
 
 @api_router.get("/")
@@ -195,12 +344,22 @@ async def me(request: Request) -> UserPublic:
 @api_router.get("/dashboard")
 async def dashboard(request: Request) -> Dict[str, Any]:
     user = await get_current_user(request)
-    settings = await get_settings()
-    schedule = await db.schedule.find_one({"schedule_id": "weekly"}, {"_id": 0})
-    schedule = clean(schedule) or {"schedule_id": "weekly", "check_in": "08:00", "check_out": "17:00", "grace_minutes": 15}
+    offices = await list_offices(active_only=True)
+    schedule = await get_schedule()
     today = now_utc().strftime("%Y-%m-%d")
+    holiday = await is_holiday(today)
     record = await db.attendance.find_one({"user_id": user["user_id"], "date": today}, {"_id": 0}, sort=[("created_at", -1)])
-    return {"user": user, "settings": settings, "schedule": schedule, "today": clean(record), "server_time": now_utc()}
+    # Legacy field "settings" kept for backward-compatible frontend keys (uses first active office).
+    primary = offices[0] if offices else {"office_name": "PKUCity Office", "latitude": 0.0, "longitude": 0.0, "radius_meters": 100}
+    return {
+        "user": user,
+        "settings": primary,
+        "offices": offices,
+        "schedule": schedule,
+        "today": clean(record),
+        "holiday": clean(holiday) if holiday else None,
+        "server_time": now_utc(),
+    }
 
 
 @api_router.get("/attendance", response_model=List[Dict[str, Any]])
@@ -210,28 +369,120 @@ async def attendance_history(request: Request) -> List[Dict[str, Any]]:
     return [clean(record) for record in records]
 
 
+@api_router.post("/liveness/session")
+async def create_liveness_session(request: Request) -> Dict[str, Any]:
+    user = await get_current_user(request)
+    session_id = f"live_{secrets.token_urlsafe(24)}"
+    challenges = list(secrets.SystemRandom().sample(LIVENESS_CHALLENGES, len(LIVENESS_CHALLENGES)))
+    await db.liveness_sessions.insert_one({
+        "liveness_session_id": session_id,
+        "user_id": user["user_id"],
+        "challenges": challenges,
+        "created_at": now_utc(),
+        "expires_at": now_utc() + timedelta(minutes=3),
+        "used": False,
+    })
+    return {"liveness_session_id": session_id, "steps": challenges, "expires_in": 180}
+
+
+async def read_upload_limited(upload: UploadFile, limit: int = 12_000_000) -> bytes:
+    data = bytearray()
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > limit:
+            raise HTTPException(status_code=413, detail="Liveness video is too large")
+    return bytes(data)
+
+
+@api_router.post("/liveness/verify")
+async def verify_liveness(request: Request) -> Dict[str, Any]:
+    user = await get_current_user(request)
+    form = await request.form()
+    liveness_session_id = form.get("liveness_session_id")
+    video = form.get("video")
+    if not isinstance(liveness_session_id, str) or not liveness_session_id or not hasattr(video, "read") or not hasattr(video, "content_type"):
+        raise HTTPException(status_code=400, detail="Liveness session and video are required")
+    liveness_session = await db.liveness_sessions.find_one_and_update(
+        {"liveness_session_id": liveness_session_id, "user_id": user["user_id"], "used": False, "expires_at": {"$gt": now_utc()}},
+        {"$set": {"used": True, "used_at": now_utc()}},
+        {"_id": 0},
+    )
+    if not liveness_session:
+        raise HTTPException(status_code=400, detail="Liveness session is invalid, expired, or already used")
+    allowed_types = {"video/mp4", "video/quicktime", "video/webm", "application/octet-stream"}
+    if video.content_type not in allowed_types:
+        raise HTTPException(status_code=415, detail="Unsupported liveness video type")
+    video_data = await read_upload_limited(video)
+    if not video_data:
+        raise HTTPException(status_code=400, detail="Empty liveness video")
+    work_dir = Path(tempfile.mkdtemp(prefix="pkucity-live-"))
+    video_path = work_dir / "capture.video"
+    try:
+        video_path.write_bytes(video_data)
+        verdict = analyze_liveness(str(video_path), liveness_session["challenges"])
+        result = {
+            "liveness_session_id": liveness_session_id,
+            "user_id": user["user_id"],
+            "passed": verdict["passed"],
+            "reason": verdict["reason"],
+            "events": verdict["events"],
+            "face_frames": verdict["face_frames"],
+            "video_sha256": hashlib.sha256(video_data).hexdigest(),
+            "created_at": now_utc(),
+            "attendance_used": False,
+        }
+        await db.liveness_results.insert_one(dict(result))
+        result.pop("user_id", None)
+        result.pop("video_sha256", None)
+        return clean(result)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @api_router.post("/attendance")
 async def create_attendance(payload: AttendanceCreate, request: Request) -> Dict[str, Any]:
     user = await get_current_user(request)
-    settings = await get_settings()
-    distance = distance_meters(payload.latitude, payload.longitude, settings["latitude"], settings["longitude"])
-    if distance > settings["radius_meters"]:
-        return {"accepted": False, "reason": "geofence", "message": f"You are {round(distance)}m from the office. Move within {settings['radius_meters']}m."}
-    if not payload.face_verified or payload.liveness_signal != "blink-and-smile":
-        return {"accepted": False, "reason": "liveness", "message": "Face liveness check failed. Please retake the guided selfie."}
+    today = now_utc().strftime("%Y-%m-%d")
+    holiday = await is_holiday(today)
+    if holiday:
+        return {"accepted": False, "reason": "holiday", "message": f"Today is a holiday ({holiday.get('label')}). Attendance is not required."}
+    offices = await list_offices(active_only=True)
+    if not offices:
+        return {"accepted": False, "reason": "no_office", "message": "No active office is configured. Please contact your admin."}
+    nearest = nearest_office(offices, payload.latitude, payload.longitude)
+    if not nearest or nearest["distance_meters"] > nearest["radius_meters"]:
+        return {
+            "accepted": False,
+            "reason": "geofence",
+            "message": f"You are {nearest['distance_meters']}m from '{nearest['office_name']}'. Move within {nearest['radius_meters']}m.",
+        }
+    liveness_result = await db.liveness_results.find_one_and_update(
+        {"liveness_session_id": payload.liveness_session_id, "user_id": user["user_id"], "passed": True, "attendance_used": False},
+        {"$set": {"attendance_used": True, "attendance_used_at": now_utc()}},
+        {"_id": 0},
+    )
+    if not liveness_result:
+        return {"accepted": False, "reason": "liveness", "message": "Face liveness verification failed or has already been used. Please record a new challenge video."}
     record = {
         "attendance_id": f"att_{uuid.uuid4().hex[:12]}",
         "user_id": user["user_id"],
-        "date": now_utc().strftime("%Y-%m-%d"),
+        "user_email": user.get("email"),
+        "user_name": user.get("name"),
+        "date": today,
         "action": payload.action,
         "latitude": payload.latitude,
         "longitude": payload.longitude,
-        "distance_meters": round(distance),
+        "distance_meters": nearest["distance_meters"],
+        "office_id": nearest["office_id"],
+        "office_name": nearest["office_name"],
         "verification": "verified",
         "created_at": now_utc(),
     }
     await db.attendance.insert_one(dict(record))
-    return {"accepted": True, "record": record, "message": "Attendance recorded successfully."}
+    return {"accepted": True, "record": record, "message": f"Attendance recorded at '{nearest['office_name']}'."}
 
 
 @api_router.post("/admin/request")
@@ -250,19 +501,113 @@ async def request_admin_access(request: Request) -> Dict[str, Any]:
 @api_router.get("/admin/overview")
 async def admin_overview(request: Request) -> Dict[str, Any]:
     await require_admin(request)
-    settings = await get_settings()
-    schedule = await db.schedule.find_one({"schedule_id": "weekly"}, {"_id": 0}) or {"schedule_id": "weekly", "check_in": "08:00", "check_out": "17:00", "grace_minutes": 15}
+    offices = await list_offices()
+    schedule = await get_schedule()
     requests = await db.admin_requests.find({"status": "pending"}, {"_id": 0}).sort("created_at", -1).to_list(50)
-    return {"settings": settings, "schedule": clean(schedule), "requests": [clean(item) for item in requests]}
+    holidays = await list_holidays()
+    return {
+        "settings": offices[0] if offices else {},
+        "offices": offices,
+        "schedule": schedule,
+        "requests": [clean(item) for item in requests],
+        "holidays": holidays,
+    }
 
 
-@api_router.patch("/admin/settings")
-async def update_settings(payload: SettingsUpdate, request: Request) -> Dict[str, Any]:
+# ---- Multi-office admin endpoints ------------------------------------------------
+
+
+@api_router.get("/admin/offices")
+async def get_offices(request: Request) -> List[Dict[str, Any]]:
     await require_admin(request)
-    updates = {key: value for key, value in payload.model_dump().items() if value is not None}
+    return await list_offices()
+
+
+@api_router.post("/admin/offices")
+async def create_office(payload: OfficeCreate, request: Request) -> Dict[str, Any]:
+    await require_admin(request)
+    office = {
+        "office_id": f"off_{uuid.uuid4().hex[:12]}",
+        **payload.model_dump(),
+        "created_at": now_utc(),
+        "updated_at": now_utc(),
+    }
+    await db.offices.insert_one(dict(office))
+    return clean(office)
+
+
+@api_router.patch("/admin/offices/{office_id}")
+async def update_office(office_id: str, payload: OfficeUpdate, request: Request) -> Dict[str, Any]:
+    await require_admin(request)
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
     updates["updated_at"] = now_utc()
-    await db.settings.update_one({"settings_id": "primary"}, {"$set": updates}, upsert=True)
-    return clean(await db.settings.find_one({"settings_id": "primary"}, {"_id": 0}))
+    result = await db.offices.find_one_and_update(
+        {"office_id": office_id}, {"$set": updates}, {"_id": 0}, return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Office not found")
+    return clean(result)
+
+
+@api_router.delete("/admin/offices/{office_id}")
+async def delete_office(office_id: str, request: Request) -> Dict[str, str]:
+    await require_admin(request)
+    active_count = await db.offices.count_documents({"active": True})
+    target = await db.offices.find_one({"office_id": office_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Office not found")
+    if target.get("active") and active_count <= 1:
+        raise HTTPException(status_code=400, detail="Cannot delete the last active office. Add another active office first.")
+    await db.offices.delete_one({"office_id": office_id})
+    return {"status": "deleted"}
+
+
+# Backwards-compatible single-office patch (updates the first office).
+@api_router.patch("/admin/settings")
+async def update_settings(payload: OfficeUpdate, request: Request) -> Dict[str, Any]:
+    await require_admin(request)
+    offices = await list_offices()
+    if not offices:
+        raise HTTPException(status_code=400, detail="No office to update")
+    return await update_office(offices[0]["office_id"], payload, request)
+
+
+# ---- Holidays --------------------------------------------------------------------
+
+
+@api_router.get("/admin/holidays")
+async def get_holidays(request: Request) -> List[Dict[str, Any]]:
+    await require_admin(request)
+    return await list_holidays()
+
+
+@api_router.post("/admin/holidays")
+async def create_holiday(payload: HolidayCreate, request: Request) -> Dict[str, Any]:
+    await require_admin(request)
+    holiday = {
+        "holiday_id": f"hol_{uuid.uuid4().hex[:12]}",
+        **payload.model_dump(),
+        "created_at": now_utc(),
+    }
+    try:
+        await db.holidays.insert_one(dict(holiday))
+    except Exception:
+        raise HTTPException(status_code=409, detail="A holiday already exists for this date")
+    return clean(holiday)
+
+
+@api_router.delete("/admin/holidays/{holiday_id}")
+async def delete_holiday(holiday_id: str, request: Request) -> Dict[str, str]:
+    await require_admin(request)
+    result = await db.holidays.delete_one({"holiday_id": holiday_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Holiday not found")
+    return {"status": "deleted"}
+
+
+# ---- Schedule --------------------------------------------------------------------
 
 
 @api_router.patch("/admin/schedule")
@@ -282,6 +627,97 @@ async def approve_admin(request_id: str, request: Request) -> Dict[str, str]:
     await db.users.update_one({"user_id": access_request["user_id"]}, {"$set": {"role": "admin", "updated_at": now_utc()}})
     await db.admin_requests.update_one({"request_id": request_id}, {"$set": {"status": "approved", "resolved_at": now_utc()}})
     return {"status": "approved"}
+
+
+# ---- Reports ---------------------------------------------------------------------
+
+
+def _parse_date(value: Optional[str], fallback: str) -> str:
+    if value and len(value) == 10:
+        return value
+    return fallback
+
+
+async def _report_rows(request: Request, date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    await require_admin(request)
+    cursor = db.attendance.find(
+        {"date": {"$gte": date_from, "$lte": date_to}},
+        {"_id": 0},
+    ).sort("created_at", -1)
+    docs = await cursor.to_list(2000)
+    return [clean(doc) for doc in docs]
+
+
+@api_router.get("/admin/reports")
+async def admin_reports(request: Request, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
+    today = now_utc().strftime("%Y-%m-%d")
+    first_of_month = now_utc().replace(day=1).strftime("%Y-%m-%d")
+    date_from = _parse_date(date_from, first_of_month)
+    date_to = _parse_date(date_to, today)
+    rows = await _report_rows(request, date_from, date_to)
+    summary: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = row.get("user_id") or "unknown"
+        bucket = summary.setdefault(key, {
+            "user_id": key,
+            "name": row.get("user_name") or row.get("user_email") or key,
+            "email": row.get("user_email"),
+            "check_ins": 0,
+            "check_outs": 0,
+            "last_action": None,
+            "last_at": None,
+        })
+        if row.get("action") == "check_in":
+            bucket["check_ins"] += 1
+        elif row.get("action") == "check_out":
+            bucket["check_outs"] += 1
+        created_at = row.get("created_at")
+        if isinstance(created_at, datetime):
+            iso = created_at.isoformat()
+            if bucket["last_at"] is None or iso > bucket["last_at"]:
+                bucket["last_at"] = iso
+                bucket["last_action"] = row.get("action")
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "total_rows": len(rows),
+        "summary": list(summary.values()),
+        "rows": rows,
+    }
+
+
+@api_router.get("/admin/reports/export")
+async def admin_reports_export(request: Request, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Response:
+    today = now_utc().strftime("%Y-%m-%d")
+    first_of_month = now_utc().replace(day=1).strftime("%Y-%m-%d")
+    date_from = _parse_date(date_from, first_of_month)
+    date_to = _parse_date(date_to, today)
+    rows = await _report_rows(request, date_from, date_to)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["Date", "Time (UTC)", "Name", "Email", "Action", "Office", "Distance (m)", "Latitude", "Longitude", "Verification"])
+    for row in rows:
+        created_at = row.get("created_at")
+        time_str = created_at.isoformat() if isinstance(created_at, datetime) else ""
+        writer.writerow([
+            row.get("date", ""),
+            time_str,
+            row.get("user_name", ""),
+            row.get("user_email", ""),
+            row.get("action", ""),
+            row.get("office_name", ""),
+            row.get("distance_meters", ""),
+            row.get("latitude", ""),
+            row.get("longitude", ""),
+            row.get("verification", ""),
+        ])
+    csv_data = buffer.getvalue()
+    filename = f"pkucity-attendance-{date_from}-to-{date_to}.csv"
+    return Response(
+        content=csv_data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 app.include_router(api_router)
