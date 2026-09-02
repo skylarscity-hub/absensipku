@@ -24,15 +24,15 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 WebBrowser.maybeCompleteAuthSession();
 
-type User = { user_id: string; email: string; name: string; role: "employee" | "admin"; email_verified: boolean };
+type User = { user_id: string; email: string; name: string; role: "employee" | "admin"; email_verified: boolean; full_name?: string | null; department?: string | null; profile_complete?: boolean };
 type Office = { office_id: string; office_name: string; latitude: number; longitude: number; radius_meters: number; active: boolean };
 type Holiday = { holiday_id: string; date: string; label: string };
 type Dashboard = { user: User; settings: Office; offices: Office[]; schedule: { check_in: string; check_out: string; grace_minutes: number }; today?: { action?: string; created_at?: string }; holiday?: { label: string } | null };
 type RecordItem = { attendance_id: string; date: string; action: string; distance_meters: number; verification: string; created_at: string; office_name?: string };
 type AdminOverview = { settings: Office; offices: Office[]; schedule: Dashboard["schedule"]; requests: { request_id: string; name: string; email: string }[]; holidays: Holiday[] };
 type LivenessSession = { liveness_session_id: string; steps: string[]; expires_in: number };
-type ReportSummary = { user_id: string; name: string; email?: string; check_ins: number; check_outs: number; last_action?: string; last_at?: string };
-type ReportPayload = { date_from: string; date_to: string; total_rows: number; summary: ReportSummary[] };
+type ReportSummary = { user_id: string; name: string; email?: string; check_ins: number; check_outs: number; overtime_minutes?: number; last_action?: string; last_at?: string };
+type ReportPayload = { date_from: string; date_to: string; total_rows: number; summary: ReportSummary[]; schedule?: { check_out: string; grace_minutes: number } };
 
 // Frontend contract: EXPO_PUBLIC_BACKEND_URL is supplied by frontend/.env.
 const backendUrl = ((Constants.expoConfig?.extra as { backendUrl?: string } | undefined)?.backendUrl || process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/\/$/, "");
@@ -263,9 +263,46 @@ function HistoryScreen({ records, loading }: { records: RecordItem[]; loading: b
   return <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 30 }]}><Text style={styles.heading}>Attendance history</Text><Text style={styles.subheading}>Your verified attendance records</Text>{loading ? <ActivityIndicator color="#DC2626" style={{ marginTop: 42 }} /> : records.length === 0 ? <View style={styles.empty}><Ionicons name="calendar-outline" size={35} color="#DC2626" /><Text style={styles.emptyTitle}>No records yet</Text><Text style={styles.emptyBody}>Your successful check-ins and check-outs will appear here.</Text></View> : records.map((record) => <View style={styles.historyCard} key={record.attendance_id}><View style={styles.historyIcon}><Ionicons name={record.action === "check_in" ? "log-in-outline" : "log-out-outline"} size={20} color="#DC2626" /></View><View style={styles.historyCopy}><Text style={styles.historyDate}>{record.date}</Text><Text style={styles.historyTime}>{record.action === "check_in" ? "Check in" : "Check out"} · {new Date(record.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{record.office_name ? ` · ${record.office_name}` : ""}</Text></View><View style={styles.historyRight}><StatusPill label="Verified" /><Text style={styles.distance}>{record.distance_meters}m away</Text></View></View>)}</ScrollView>;
 }
 
+// ------------------ Onboarding --------------------------------------------------
+
+function OnboardingScreen({ user, token, onDone }: { user: User; token: string; onDone: (updated: User) => void }) {
+  const insets = useSafeAreaInsets();
+  const [fullName, setFullName] = useState(user.full_name || user.name || "");
+  const [department, setDepartment] = useState(user.department || "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async () => {
+    if (!fullName.trim() || !department.trim()) { setError("Please fill both fields."); return; }
+    setSaving(true); setError("");
+    try {
+      const updated = await apiRequest<User>("/profile", token, { method: "PATCH", body: JSON.stringify({ full_name: fullName.trim(), department: department.trim() }) });
+      onDone(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save profile");
+    } finally { setSaving(false); }
+  };
+  return <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.flex}>
+    <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 40, paddingBottom: insets.bottom + 40 }]} keyboardShouldPersistTaps="handled">
+      <BrandMark />
+      <Text style={[styles.eyebrow, { marginTop: 30 }]}>WELCOME TO PKUCITY</Text>
+      <Text style={styles.heading}>Complete your profile</Text>
+      <Text style={styles.subheading}>Tell us your full name and job department so attendance records show the right details.</Text>
+      <View style={styles.formCard}>
+        <Field label="Full name" value={fullName} onChangeText={setFullName} />
+        <Field label="Department / job area" value={department} onChangeText={setDepartment} />
+        {!!error && <Text style={styles.captureNoticeError}>{error}</Text>}
+        <Pressable testID="onboarding-submit-button" onPress={submit} disabled={saving} style={[styles.primaryButton, saving && styles.disabled]}>
+          {saving ? <ActivityIndicator color="#fff" /> : <><Ionicons name="arrow-forward" size={18} color="#fff" /><Text style={styles.primaryButtonText}>Save and continue</Text></>}
+        </Pressable>
+      </View>
+      <Text style={styles.actionCaption}>Signed in as {user.email}</Text>
+    </ScrollView>
+  </KeyboardAvoidingView>;
+}
+
 // ------------------ Admin -------------------------------------------------------
 
-type AdminTab = "access" | "offices" | "holidays" | "schedule" | "reports";
+type AdminTab = "access" | "offices" | "users" | "holidays" | "schedule" | "reports";
 
 function AdminScreen({ token }: { token: string }) {
   const [overview, setOverview] = useState<AdminOverview | null>(null);
@@ -285,7 +322,7 @@ function AdminScreen({ token }: { token: string }) {
     try { await apiRequest(`/admin/requests/${id}/approve`, token, { method: "POST" }); setMessage("Admin request approved."); await load(); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not approve request"); }
   };
-  const tabs: [AdminTab, string][] = [["access", "Access"], ["offices", "Offices"], ["schedule", "Schedule"], ["holidays", "Holidays"], ["reports", "Reports"]];
+  const tabs: [AdminTab, string][] = [["access", "Access"], ["offices", "Offices"], ["users", "Users"], ["schedule", "Schedule"], ["holidays", "Holidays"], ["reports", "Reports"]];
   return <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.flex}>
     <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 30 }]}>
       <Text style={styles.heading}>Admin controls</Text>
@@ -300,6 +337,7 @@ function AdminScreen({ token }: { token: string }) {
       {!!message && <View style={styles.successBanner}><Ionicons name="information-circle" size={18} color="#15803D" /><Text style={styles.successBannerText}>{message}</Text></View>}
       {tab === "access" && <AccessTab overview={overview} onApprove={approve} />}
       {tab === "offices" && <OfficesTab token={token} overview={overview} onChange={load} onMessage={setMessage} />}
+      {tab === "users" && <UsersTab token={token} onMessage={setMessage} />}
       {tab === "schedule" && <ScheduleTab token={token} overview={overview} onChange={load} onMessage={setMessage} />}
       {tab === "holidays" && <HolidaysTab token={token} overview={overview} onChange={load} onMessage={setMessage} />}
       {tab === "reports" && <ReportsTab token={token} />}
@@ -451,6 +489,63 @@ function HolidaysTab({ token, overview, onChange, onMessage }: { token: string; 
   </View>;
 }
 
+function UsersTab({ token, onMessage }: { token: string; onMessage: (msg: string) => void }) {
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [editing, setEditing] = useState<Record<string, { full_name: string; department: string }>>({});
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await apiRequest<User[]>("/admin/users", token);
+      setUsers(data);
+    } catch (err) { onMessage(err instanceof Error ? err.message : "Could not load users"); }
+    finally { setLoading(false); }
+  }, [token, onMessage]);
+  useEffect(() => { load(); }, [load]);
+  const startEdit = (u: User) => setEditing((prev) => ({ ...prev, [u.user_id]: { full_name: u.full_name || u.name || "", department: u.department || "" } }));
+  const cancelEdit = (id: string) => setEditing((prev) => { const next = { ...prev }; delete next[id]; return next; });
+  const save = async (u: User) => {
+    const draft = editing[u.user_id];
+    if (!draft || !draft.full_name.trim() || !draft.department.trim()) { onMessage("Both fields are required"); return; }
+    setBusyId(u.user_id);
+    try {
+      await apiRequest(`/admin/users/${u.user_id}`, token, { method: "PATCH", body: JSON.stringify({ full_name: draft.full_name.trim(), department: draft.department.trim() }) });
+      onMessage(`Updated ${draft.full_name.trim()}`);
+      cancelEdit(u.user_id);
+      await load();
+    } catch (err) { onMessage(err instanceof Error ? err.message : "Could not save user"); }
+    finally { setBusyId(null); }
+  };
+  if (loading && !users.length) return <ActivityIndicator color="#DC2626" style={{ marginTop: 24 }} />;
+  if (!users.length) return <View style={styles.emptySmall}><Ionicons name="people-outline" size={25} color="#DC2626" /><Text style={styles.emptyTitle}>No users yet</Text><Text style={styles.emptyBody}>Users appear after their first Google sign-in.</Text></View>;
+  return <View>{users.map((u) => {
+    const draft = editing[u.user_id];
+    if (draft) {
+      return <View testID={`user-edit-${u.user_id}`} style={styles.formCard} key={u.user_id}>
+        <Text style={styles.formTitle}>{u.email}</Text>
+        <Text style={styles.formHint}>{u.role === "admin" ? "Administrator" : "Employee"}{u.profile_complete ? "" : " · profile pending"}</Text>
+        <Field label="Full name" value={draft.full_name} onChangeText={(v) => setEditing((prev) => ({ ...prev, [u.user_id]: { ...draft, full_name: v } }))} />
+        <Field label="Department / job area" value={draft.department} onChangeText={(v) => setEditing((prev) => ({ ...prev, [u.user_id]: { ...draft, department: v } }))} />
+        <View style={styles.officeActions}>
+          <Pressable testID={`user-cancel-${u.user_id}`} onPress={() => cancelEdit(u.user_id)} style={[styles.outlineButton, { flex: 1 }]}><Text style={styles.outlineText}>Cancel</Text></Pressable>
+          <Pressable testID={`user-save-${u.user_id}`} onPress={() => save(u)} disabled={busyId === u.user_id} style={[styles.primaryButton, { flex: 1 }]}>
+            {busyId === u.user_id ? <ActivityIndicator color="#fff" /> : <><Ionicons name="save-outline" size={16} color="#fff" /><Text style={styles.primaryButtonText}>Save</Text></>}
+          </Pressable>
+        </View>
+      </View>;
+    }
+    return <View testID={`user-card-${u.user_id}`} style={styles.requestCard} key={u.user_id}>
+      <View style={styles.avatarSmall}><Text style={styles.avatarText}>{initials(u.full_name || u.name)}</Text></View>
+      <View style={styles.requestCopy}>
+        <Text style={styles.verifyTitle}>{u.full_name || u.name}</Text>
+        <Text style={styles.verifySub}>{u.department || (u.profile_complete ? "—" : "Profile pending")} · {u.email}</Text>
+      </View>
+      <Pressable testID={`user-edit-btn-${u.user_id}`} onPress={() => startEdit(u)} style={styles.approve}><Text style={styles.approveText}>Edit</Text></Pressable>
+    </View>;
+  })}</View>;
+}
+
 function ReportsTab({ token }: { token: string }) {
   const today = new Date().toISOString().slice(0, 10);
   const firstOfMonth = new Date().toISOString().slice(0, 8) + "01";
@@ -492,7 +587,7 @@ function ReportsTab({ token }: { token: string }) {
         </Pressable>
       </View>
       {!!error && <Text style={styles.captureNoticeError}>{error}</Text>}
-      {report && <Text style={styles.formHint}>{report.total_rows} records · {report.summary.length} employees</Text>}
+      {report && <Text style={styles.formHint}>{report.total_rows} records · {report.summary.length} employees · overtime after {report.schedule?.check_out || "17:00"} (+{report.schedule?.grace_minutes ?? 0}m grace)</Text>}
     </View>
     {(report?.summary || []).map((summary) => (
       <View testID={`report-row-${summary.user_id}`} style={styles.requestCard} key={summary.user_id}>
@@ -500,6 +595,7 @@ function ReportsTab({ token }: { token: string }) {
         <View style={styles.requestCopy}>
           <Text style={styles.verifyTitle}>{summary.name}</Text>
           <Text style={styles.verifySub}>{summary.email || summary.user_id}</Text>
+          {(summary.overtime_minutes ?? 0) > 0 && <Text testID={`overtime-${summary.user_id}`} style={styles.overtimeText}>+{Math.floor((summary.overtime_minutes || 0) / 60)}h {(summary.overtime_minutes || 0) % 60}m overtime</Text>}
         </View>
         <View style={{ alignItems: "flex-end" }}>
           <Text style={styles.reportMetric}>{summary.check_ins} in</Text>
@@ -539,6 +635,7 @@ export default function Index() {
   const done = (message: string) => { setCaptureAction(null); Alert.alert("Attendance verified", message); refresh(); };
   if (authState === "loading" || (authBusy && authState !== "signed_in")) return <LoadingScreen />;
   if (authState === "signed_out" || !user) return <AuthScreen onLogin={login} busy={authBusy} error={authError} />;
+  if (!user.profile_complete) return <OnboardingScreen user={user} token={token} onDone={(updated) => setUser(updated)} />;
   if (captureAction) return <CaptureScreen action={captureAction} token={token} onDone={done} onCancel={() => setCaptureAction(null)} />;
   return <View style={[styles.root, { paddingBottom: insets.bottom }]}>{active === "home" && <HomeScreen dashboard={dashboard} onRefresh={refresh} onOpenCapture={setCaptureAction} />}{active === "history" && <HistoryScreen records={records} loading={!records} />}{active === "admin" && user.role === "admin" && <AdminScreen token={token} />}{active === "profile" && <ProfileScreen user={user} token={token} onRequestAdmin={() => setActive("profile")} onLogout={signOut} />}<BottomBar active={active} onChange={setActive} isAdmin={user.role === "admin"} /></View>;
 }
@@ -705,4 +802,5 @@ const styles = StyleSheet.create({
   errorText: { flex: 1, color: "#991B1B", fontSize: 12, lineHeight: 17 },
   reportMetric: { color: "#111827", fontSize: 14, fontWeight: "800" },
   reportMetricMuted: { color: "#6B7280", fontSize: 12, marginTop: 2 },
+  overtimeText: { color: "#B45309", fontSize: 11, fontWeight: "700", marginTop: 4 },
 });

@@ -34,6 +34,9 @@ Build a mobile attendance app where employees sign in with verified Google accou
 - Added Reports tab with date-range summary + CSV export shared via native Share sheet.
 - Rewrote liveness capture UI: explicit "record video" copy, per-step highlighted prompts, REC badge, and stop button. Recording duration auto-adapts to the number of challenges (2.2s each).
 - Home shows "Face liveness (video)" and nearest office name instead of the single office.
+- **Onboarding**: new users are forced to complete `full_name` + `department` on first sign-in (`PATCH /api/profile`, gated by `profile_complete` flag).
+- **Admin Users tab**: admin can list all users (`GET /api/admin/users`) and edit any user's full name and department (`PATCH /api/admin/users/{id}`).
+- **Overtime**: reports calculate overtime minutes per user (latest check-out per day minus scheduled `check_out + grace_minutes`). Shown in the Reports card and included as an "Overtime (min)" column in the CSV export.
 
 ## Backlog
 - P1: Add employee roster / teams; per-team schedules; PDF export.

@@ -57,6 +57,21 @@ class UserPublic(BaseModel):
     picture: Optional[str] = None
     role: Literal["employee", "admin"] = "employee"
     email_verified: bool = True
+    full_name: Optional[str] = None
+    department: Optional[str] = None
+    profile_complete: bool = False
+
+
+class ProfileUpdate(BaseModel):
+    full_name: str = Field(min_length=1, max_length=120)
+    department: str = Field(min_length=1, max_length=120)
+
+
+class AdminUserUpdate(BaseModel):
+    full_name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    department: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    role: Optional[Literal["employee", "admin"]] = None
 
 
 class SessionResponse(BaseModel):
@@ -318,10 +333,13 @@ async def create_session(payload: SessionRequest) -> SessionResponse:
     user_doc = {
         "user_id": existing.get("user_id", user_id) if existing else user_id,
         "email": email,
-        "name": identity.get("name") or email.split("@")[0],
-        "picture": identity.get("picture") or identity.get("avatar"),
+        "name": (existing or {}).get("name") or identity.get("name") or email.split("@")[0],
+        "picture": identity.get("picture") or identity.get("avatar") or (existing or {}).get("picture"),
         "role": role,
         "email_verified": True,
+        "full_name": (existing or {}).get("full_name"),
+        "department": (existing or {}).get("department"),
+        "profile_complete": bool((existing or {}).get("profile_complete", False)),
         "updated_at": now_utc(),
     }
     await db.users.update_one({"email": email}, {"$set": user_doc, "$setOnInsert": {"created_at": now_utc()}}, upsert=True)
@@ -339,6 +357,21 @@ async def create_session(payload: SessionRequest) -> SessionResponse:
 @api_router.get("/auth/me", response_model=UserPublic)
 async def me(request: Request) -> UserPublic:
     return UserPublic(**(await get_current_user(request)))
+
+
+@api_router.patch("/profile", response_model=UserPublic)
+async def update_profile(payload: ProfileUpdate, request: Request) -> UserPublic:
+    user = await get_current_user(request)
+    updates = {
+        "full_name": payload.full_name.strip(),
+        "department": payload.department.strip(),
+        "name": payload.full_name.strip(),
+        "profile_complete": True,
+        "updated_at": now_utc(),
+    }
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+    refreshed = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return UserPublic(**clean(refreshed))
 
 
 @api_router.get("/dashboard")
@@ -470,7 +503,8 @@ async def create_attendance(payload: AttendanceCreate, request: Request) -> Dict
         "attendance_id": f"att_{uuid.uuid4().hex[:12]}",
         "user_id": user["user_id"],
         "user_email": user.get("email"),
-        "user_name": user.get("name"),
+        "user_name": user.get("full_name") or user.get("name"),
+        "department": user.get("department"),
         "date": today,
         "action": payload.action,
         "latitude": payload.latitude,
@@ -629,6 +663,34 @@ async def approve_admin(request_id: str, request: Request) -> Dict[str, str]:
     return {"status": "approved"}
 
 
+# ---- Admin users ----------------------------------------------------------------
+
+
+@api_router.get("/admin/users")
+async def admin_users(request: Request) -> List[Dict[str, Any]]:
+    await require_admin(request)
+    docs = await db.users.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return [clean(item) for item in docs]
+
+
+@api_router.patch("/admin/users/{user_id}", response_model=UserPublic)
+async def admin_update_user(user_id: str, payload: AdminUserUpdate, request: Request) -> UserPublic:
+    await require_admin(request)
+    updates: Dict[str, Any] = {k: v.strip() if isinstance(v, str) else v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    if "full_name" in updates and "name" not in updates:
+        updates["name"] = updates["full_name"]
+    if "full_name" in updates or "department" in updates:
+        updates["profile_complete"] = True
+    updates["updated_at"] = now_utc()
+    result = await db.users.update_one({"user_id": user_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    refreshed = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    return UserPublic(**clean(refreshed))
+
+
 # ---- Reports ---------------------------------------------------------------------
 
 
@@ -655,7 +717,14 @@ async def admin_reports(request: Request, date_from: Optional[str] = None, date_
     date_from = _parse_date(date_from, first_of_month)
     date_to = _parse_date(date_to, today)
     rows = await _report_rows(request, date_from, date_to)
+    schedule = await get_schedule()
+    check_out_hour, check_out_minute = [int(part) for part in schedule["check_out"].split(":")]
+    grace = int(schedule.get("grace_minutes", 0))
+    scheduled_end_minutes = check_out_hour * 60 + check_out_minute + grace
+
     summary: Dict[str, Dict[str, Any]] = {}
+    # First pass: aggregate counts + overtime per (user, date)
+    latest_checkout: Dict[str, Dict[str, datetime]] = {}
     for row in rows:
         key = row.get("user_id") or "unknown"
         bucket = summary.setdefault(key, {
@@ -664,6 +733,7 @@ async def admin_reports(request: Request, date_from: Optional[str] = None, date_
             "email": row.get("user_email"),
             "check_ins": 0,
             "check_outs": 0,
+            "overtime_minutes": 0,
             "last_action": None,
             "last_at": None,
         })
@@ -671,16 +741,33 @@ async def admin_reports(request: Request, date_from: Optional[str] = None, date_
             bucket["check_ins"] += 1
         elif row.get("action") == "check_out":
             bucket["check_outs"] += 1
+            created_at = row.get("created_at")
+            date_str = row.get("date")
+            if isinstance(created_at, datetime) and date_str:
+                per_day = latest_checkout.setdefault(key, {})
+                if date_str not in per_day or created_at > per_day[date_str]:
+                    per_day[date_str] = created_at
         created_at = row.get("created_at")
         if isinstance(created_at, datetime):
             iso = created_at.isoformat()
             if bucket["last_at"] is None or iso > bucket["last_at"]:
                 bucket["last_at"] = iso
                 bucket["last_action"] = row.get("action")
+    # Second pass: overtime totals
+    for user_id, dates in latest_checkout.items():
+        total_overtime = 0
+        for _, dt in dates.items():
+            minutes_of_day = dt.hour * 60 + dt.minute
+            diff = minutes_of_day - scheduled_end_minutes
+            if diff > 0:
+                total_overtime += diff
+        if user_id in summary:
+            summary[user_id]["overtime_minutes"] = total_overtime
     return {
         "date_from": date_from,
         "date_to": date_to,
         "total_rows": len(rows),
+        "schedule": {"check_out": schedule["check_out"], "grace_minutes": grace},
         "summary": list(summary.values()),
         "rows": rows,
     }
@@ -693,24 +780,41 @@ async def admin_reports_export(request: Request, date_from: Optional[str] = None
     date_from = _parse_date(date_from, first_of_month)
     date_to = _parse_date(date_to, today)
     rows = await _report_rows(request, date_from, date_to)
+    schedule = await get_schedule()
+    ch, cm = [int(part) for part in schedule["check_out"].split(":")]
+    grace = int(schedule.get("grace_minutes", 0))
+    scheduled_end_minutes = ch * 60 + cm + grace
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["Date", "Time (UTC)", "Name", "Email", "Action", "Office", "Distance (m)", "Latitude", "Longitude", "Verification"])
+    writer.writerow(["Date", "Time (UTC)", "Name", "Email", "Department", "Action", "Office", "Distance (m)", "Overtime (min)", "Latitude", "Longitude", "Verification"])
     for row in rows:
         created_at = row.get("created_at")
         time_str = created_at.isoformat() if isinstance(created_at, datetime) else ""
+        overtime = ""
+        if row.get("action") == "check_out" and isinstance(created_at, datetime):
+            diff = (created_at.hour * 60 + created_at.minute) - scheduled_end_minutes
+            overtime = str(max(0, diff))
         writer.writerow([
             row.get("date", ""),
             time_str,
             row.get("user_name", ""),
             row.get("user_email", ""),
+            row.get("department", ""),
             row.get("action", ""),
             row.get("office_name", ""),
             row.get("distance_meters", ""),
+            overtime,
             row.get("latitude", ""),
             row.get("longitude", ""),
             row.get("verification", ""),
         ])
+    csv_data = buffer.getvalue()
+    filename = f"pkucity-attendance-{date_from}-to-{date_to}.csv"
+    return Response(
+        content=csv_data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
     csv_data = buffer.getvalue()
     filename = f"pkucity-attendance-{date_from}-to-{date_to}.csv"
     return Response(
