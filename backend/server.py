@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+import base64
+import calendar
 import csv
 import hashlib
 import io
@@ -65,6 +67,7 @@ class UserPublic(BaseModel):
     full_name: Optional[str] = None
     department: Optional[str] = None
     profile_complete: bool = False
+    avatar: Optional[str] = None
 
 
 class ProfileUpdate(BaseModel):
@@ -77,6 +80,16 @@ class AdminUserUpdate(BaseModel):
     department: Optional[str] = Field(default=None, min_length=1, max_length=120)
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     role: Optional[Literal["employee", "admin"]] = None
+
+
+class AvatarUpload(BaseModel):
+    image_base64: str = Field(min_length=32)
+
+
+class LeaveCreate(BaseModel):
+    start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class SessionResponse(BaseModel):
@@ -211,6 +224,31 @@ LIVENESS_CHALLENGES = ("blink", "turn_left", "turn_right")
 LIVENESS_MODEL_PATH = ROOT_DIR / "models" / "face_landmarker.task"
 
 
+def extract_snapshot_data_url(video_path: str) -> Optional[str]:
+    """Grab the middle frame of the video as a downscaled JPEG data URL (for admin proof)."""
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        return None
+    try:
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        target_index = max(0, total // 2)
+        capture.set(cv2.CAP_PROP_POS_FRAMES, target_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            return None
+        h, w = frame.shape[:2]
+        max_side = 480
+        if max(h, w) > max_side:
+            scale = max_side / max(h, w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        ok, buffer_bytes = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+        if not ok:
+            return None
+        return f"data:image/jpeg;base64,{base64.b64encode(buffer_bytes.tobytes()).decode()}"
+    finally:
+        capture.release()
+
+
 def eye_aspect_ratio(points: List[Any], indexes: List[int]) -> float:
     left, top_left, bottom_left, right, top_right, bottom_right = [points[index] for index in indexes]
     horizontal = max(float(np.linalg.norm(np.array([left.x, left.y]) - np.array([right.x, right.y]))), 1e-6)
@@ -302,6 +340,8 @@ async def startup() -> None:
     await db.admin_requests.create_index("request_id", unique=True)
     await db.offices.create_index("office_id", unique=True)
     await db.holidays.create_index("date", unique=True)
+    await db.leaves.create_index("leave_id", unique=True)
+    await db.leaves.create_index([("user_id", 1), ("status", 1)])
     await ensure_default_office()
 
 
@@ -391,7 +431,8 @@ async def dashboard(request: Request) -> Dict[str, Any]:
     schedule = await get_schedule()
     today = now_utc().strftime("%Y-%m-%d")
     holiday = await is_holiday(today)
-    record = await db.attendance.find_one({"user_id": user["user_id"], "date": today}, {"_id": 0}, sort=[("created_at", -1)])
+    record = await db.attendance.find_one({"user_id": user["user_id"], "date": today}, {"_id": 0, "photo": 0}, sort=[("created_at", -1)])
+    active_leave = await get_active_leave_for_today(user["user_id"], today)
     # Legacy field "settings" kept for backward-compatible frontend keys (uses first active office).
     primary = offices[0] if offices else {"office_name": "PKUCity Office", "latitude": 0.0, "longitude": 0.0, "radius_meters": 100}
     return {
@@ -401,6 +442,7 @@ async def dashboard(request: Request) -> Dict[str, Any]:
         "schedule": schedule,
         "today": clean(record),
         "holiday": clean(holiday) if holiday else None,
+        "on_leave": active_leave,
         "server_time": now_utc(),
     }
 
@@ -408,7 +450,7 @@ async def dashboard(request: Request) -> Dict[str, Any]:
 @api_router.get("/attendance", response_model=List[Dict[str, Any]])
 async def attendance_history(request: Request) -> List[Dict[str, Any]]:
     user = await get_current_user(request)
-    records = await db.attendance.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    records = await db.attendance.find({"user_id": user["user_id"]}, {"_id": 0, "photo": 0}).sort("created_at", -1).to_list(100)
     return [clean(record) for record in records]
 
 
@@ -466,6 +508,7 @@ async def verify_liveness(request: Request) -> Dict[str, Any]:
     try:
         video_path.write_bytes(video_data)
         verdict = analyze_liveness(str(video_path), liveness_session["challenges"])
+        snapshot = extract_snapshot_data_url(str(video_path)) if verdict["passed"] else None
         result = {
             "liveness_session_id": liveness_session_id,
             "user_id": user["user_id"],
@@ -474,12 +517,14 @@ async def verify_liveness(request: Request) -> Dict[str, Any]:
             "events": verdict["events"],
             "face_frames": verdict["face_frames"],
             "video_sha256": hashlib.sha256(video_data).hexdigest(),
+            "snapshot": snapshot,
             "created_at": now_utc(),
             "attendance_used": False,
         }
         await db.liveness_results.insert_one(dict(result))
         result.pop("user_id", None)
         result.pop("video_sha256", None)
+        result.pop("snapshot", None)  # keep out of API response; admin reads via report endpoint
         return clean(result)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -523,10 +568,13 @@ async def create_attendance(payload: AttendanceCreate, request: Request) -> Dict
         "office_id": nearest["office_id"],
         "office_name": nearest["office_name"],
         "verification": "verified",
+        "photo": liveness_result.get("snapshot"),
         "created_at": now_utc(),
     }
     await db.attendance.insert_one(dict(record))
-    return {"accepted": True, "record": record, "message": f"Attendance recorded at '{nearest['office_name']}'."}
+    # Do NOT return the base64 photo in the response — it's for admin proof only.
+    response_record = {k: v for k, v in record.items() if k != "photo"}
+    return {"accepted": True, "record": response_record, "message": f"Attendance recorded at '{nearest['office_name']}'."}
 
 
 @api_router.post("/admin/request")
@@ -717,7 +765,13 @@ async def _report_rows(request: Request, date_from: str, date_to: str) -> List[D
         {"_id": 0},
     ).sort("created_at", -1)
     docs = await cursor.to_list(2000)
-    return [clean(doc) for doc in docs]
+    cleaned: List[Dict[str, Any]] = []
+    for doc in docs:
+        photo = doc.pop("photo", None)
+        row = clean(doc)
+        row["has_photo"] = bool(photo)
+        cleaned.append(row)
+    return cleaned
 
 
 @api_router.get("/admin/reports")
@@ -916,6 +970,232 @@ async def admin_reports_export_pdf(request: Request, date_from: Optional[str] = 
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---- Attendance proof photo (admin) --------------------------------------------
+
+
+@api_router.get("/admin/attendance/{attendance_id}/photo")
+async def admin_attendance_photo(attendance_id: str, request: Request) -> Response:
+    await require_admin(request)
+    doc = await db.attendance.find_one({"attendance_id": attendance_id}, {"_id": 0, "photo": 1})
+    if not doc or not doc.get("photo"):
+        raise HTTPException(status_code=404, detail="Photo not found")
+    photo = doc["photo"]
+    if not isinstance(photo, str) or "," not in photo:
+        raise HTTPException(status_code=404, detail="Photo not available")
+    header, _, b64 = photo.partition(",")
+    media_type = "image/jpeg"
+    if header.startswith("data:") and ";" in header:
+        media_type = header[5:header.index(";")]
+    try:
+        image_bytes = base64.b64decode(b64)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Photo is corrupted") from exc
+    return Response(content=image_bytes, media_type=media_type)
+
+
+# ---- Profile avatar -------------------------------------------------------------
+
+
+def _validate_avatar_payload(data_url: str) -> str:
+    if not data_url.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="Avatar must be a data URL image")
+    _, _, b64 = data_url.partition(",")
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid avatar image") from exc
+    if len(raw) > 800_000:
+        raise HTTPException(status_code=413, detail="Avatar image must be < 800KB")
+    return data_url
+
+
+@api_router.patch("/profile/avatar", response_model=UserPublic)
+async def update_avatar(payload: AvatarUpload, request: Request) -> UserPublic:
+    user = await get_current_user(request)
+    avatar = _validate_avatar_payload(payload.image_base64)
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"avatar": avatar, "updated_at": now_utc()}})
+    refreshed = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return UserPublic(**clean(refreshed))
+
+
+@api_router.get("/users/{user_id}/avatar")
+async def get_avatar(user_id: str, request: Request) -> Response:
+    await get_current_user(request)  # auth only, any authenticated user can view avatars
+    doc = await db.users.find_one({"user_id": user_id}, {"_id": 0, "avatar": 1})
+    if not doc or not doc.get("avatar"):
+        raise HTTPException(status_code=404, detail="Avatar not set")
+    avatar = doc["avatar"]
+    header, _, b64 = avatar.partition(",")
+    media_type = "image/jpeg"
+    if header.startswith("data:") and ";" in header:
+        media_type = header[5:header.index(";")]
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Avatar corrupted") from exc
+    return Response(content=raw, media_type=media_type)
+
+
+# ---- Leaves ---------------------------------------------------------------------
+
+
+def _iter_date_range(start_date: str, end_date: str) -> List[str]:
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    if end < start:
+        return []
+    days: List[str] = []
+    cursor = start
+    while cursor <= end:
+        days.append(cursor.strftime("%Y-%m-%d"))
+        cursor += timedelta(days=1)
+        if len(days) > 365:
+            break
+    return days
+
+
+async def get_active_leave_for_today(user_id: str, date_str: str) -> Optional[Dict[str, Any]]:
+    doc = await db.leaves.find_one(
+        {"user_id": user_id, "status": "approved", "start_date": {"$lte": date_str}, "end_date": {"$gte": date_str}},
+        {"_id": 0},
+    )
+    return clean(doc) if doc else None
+
+
+@api_router.post("/leaves")
+async def create_leave(payload: LeaveCreate, request: Request) -> Dict[str, Any]:
+    user = await get_current_user(request)
+    if payload.end_date < payload.start_date:
+        raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
+    leave = {
+        "leave_id": f"lv_{uuid.uuid4().hex[:12]}",
+        "user_id": user["user_id"],
+        "user_email": user.get("email"),
+        "user_name": user.get("full_name") or user.get("name"),
+        "department": user.get("department"),
+        "start_date": payload.start_date,
+        "end_date": payload.end_date,
+        "days": len(_iter_date_range(payload.start_date, payload.end_date)),
+        "reason": payload.reason.strip(),
+        "status": "pending",
+        "created_at": now_utc(),
+    }
+    await db.leaves.insert_one(dict(leave))
+    return clean(leave)
+
+
+@api_router.get("/leaves")
+async def list_my_leaves(request: Request) -> List[Dict[str, Any]]:
+    user = await get_current_user(request)
+    docs = await db.leaves.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return [clean(doc) for doc in docs]
+
+
+@api_router.get("/admin/leaves")
+async def admin_list_leaves(request: Request, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    await require_admin(request)
+    query: Dict[str, Any] = {}
+    if status in {"pending", "approved", "rejected"}:
+        query["status"] = status
+    docs = await db.leaves.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return [clean(doc) for doc in docs]
+
+
+@api_router.post("/admin/leaves/{leave_id}/approve")
+async def admin_approve_leave(leave_id: str, request: Request) -> Dict[str, str]:
+    admin = await require_admin(request)
+    result = await db.leaves.update_one(
+        {"leave_id": leave_id, "status": "pending"},
+        {"$set": {"status": "approved", "resolved_at": now_utc(), "resolved_by": admin["user_id"]}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Leave not found or already resolved")
+    return {"status": "approved"}
+
+
+@api_router.post("/admin/leaves/{leave_id}/reject")
+async def admin_reject_leave(leave_id: str, request: Request) -> Dict[str, str]:
+    admin = await require_admin(request)
+    result = await db.leaves.update_one(
+        {"leave_id": leave_id, "status": "pending"},
+        {"$set": {"status": "rejected", "resolved_at": now_utc(), "resolved_by": admin["user_id"]}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Leave not found or already resolved")
+    return {"status": "rejected"}
+
+
+# ---- Monthly stats --------------------------------------------------------------
+
+
+@api_router.get("/admin/stats")
+async def admin_stats(request: Request, year: Optional[int] = None, month: Optional[int] = None) -> Dict[str, Any]:
+    await require_admin(request)
+    now = now_utc()
+    year = year or now.year
+    month = month or now.month
+    days_in_month = calendar.monthrange(year, month)[1]
+    date_from = f"{year:04d}-{month:02d}-01"
+    date_to = f"{year:04d}-{month:02d}-{days_in_month:02d}"
+    schedule = await get_schedule()
+    ch, cm = [int(part) for part in schedule["check_in"].split(":")]
+    grace = int(schedule.get("grace_minutes", 0))
+    scheduled_start_minutes = ch * 60 + cm + grace
+
+    docs = await db.attendance.find(
+        {"date": {"$gte": date_from, "$lte": date_to}, "action": "check_in"},
+        {"_id": 0, "photo": 0},
+    ).to_list(5000)
+    approved_leaves = await db.leaves.find(
+        {"status": "approved", "start_date": {"$lte": date_to}, "end_date": {"$gte": date_from}},
+        {"_id": 0},
+    ).to_list(1000)
+    holidays = await db.holidays.find({"date": {"$gte": date_from, "$lte": date_to}}, {"_id": 0}).to_list(200)
+    holiday_set = {h["date"] for h in holidays}
+
+    per_day: Dict[str, Dict[str, Any]] = {}
+    for day_index in range(1, days_in_month + 1):
+        key = f"{year:04d}-{month:02d}-{day_index:02d}"
+        per_day[key] = {"date": key, "on_time": 0, "late": 0, "on_leave": 0, "holiday": key in holiday_set}
+
+    seen: set = set()
+    for row in docs:
+        date_str = row.get("date")
+        user_id = row.get("user_id")
+        if not date_str or not user_id or date_str not in per_day:
+            continue
+        pair = (user_id, date_str)
+        if pair in seen:
+            continue  # count first check-in per user per day
+        seen.add(pair)
+        created_at = row.get("created_at")
+        if isinstance(created_at, datetime):
+            actual = created_at.hour * 60 + created_at.minute
+            if actual <= scheduled_start_minutes:
+                per_day[date_str]["on_time"] += 1
+            else:
+                per_day[date_str]["late"] += 1
+
+    for leave in approved_leaves:
+        for date_str in _iter_date_range(leave["start_date"], leave["end_date"]):
+            if date_str in per_day:
+                per_day[date_str]["on_leave"] += 1
+
+    totals = {
+        "on_time": sum(d["on_time"] for d in per_day.values()),
+        "late": sum(d["late"] for d in per_day.values()),
+        "on_leave": sum(d["on_leave"] for d in per_day.values()),
+        "days_in_month": days_in_month,
+    }
+    return {
+        "year": year,
+        "month": month,
+        "schedule": {"check_in": schedule["check_in"], "grace_minutes": grace},
+        "totals": totals,
+        "days": list(per_day.values()),
+    }
 
 
 app.include_router(api_router)

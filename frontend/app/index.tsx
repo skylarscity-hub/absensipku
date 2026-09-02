@@ -1,6 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as Camera from "expo-camera";
 import Constants from "expo-constants";
+import * as ImagePicker from "expo-image-picker";
 import * as Linking from "expo-linking";
 import * as Location from "expo-location";
 import * as SecureStore from "expo-secure-store";
@@ -13,7 +14,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -27,15 +30,19 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 WebBrowser.maybeCompleteAuthSession();
 
-type User = { user_id: string; email: string; name: string; role: "employee" | "admin"; email_verified: boolean; full_name?: string | null; department?: string | null; profile_complete?: boolean };
+type User = { user_id: string; email: string; name: string; role: "employee" | "admin"; email_verified: boolean; full_name?: string | null; department?: string | null; profile_complete?: boolean; avatar?: string | null };
 type Office = { office_id: string; office_name: string; latitude: number; longitude: number; radius_meters: number; active: boolean };
 type Holiday = { holiday_id: string; date: string; label: string };
-type Dashboard = { user: User; settings: Office; offices: Office[]; schedule: { check_in: string; check_out: string; grace_minutes: number }; today?: { action?: string; created_at?: string }; holiday?: { label: string } | null };
+type Leave = { leave_id: string; user_id: string; user_name?: string; user_email?: string; department?: string; start_date: string; end_date: string; days: number; reason: string; status: "pending" | "approved" | "rejected"; created_at?: string };
+type Dashboard = { user: User; settings: Office; offices: Office[]; schedule: { check_in: string; check_out: string; grace_minutes: number }; today?: { action?: string; created_at?: string }; holiday?: { label: string } | null; on_leave?: Leave | null };
 type RecordItem = { attendance_id: string; date: string; action: string; distance_meters: number; verification: string; created_at: string; office_name?: string };
 type AdminOverview = { settings: Office; offices: Office[]; schedule: Dashboard["schedule"]; requests: { request_id: string; name: string; email: string }[]; holidays: Holiday[] };
 type LivenessSession = { liveness_session_id: string; steps: string[]; expires_in: number };
 type ReportSummary = { user_id: string; name: string; email?: string; check_ins: number; check_outs: number; overtime_minutes?: number; last_action?: string; last_at?: string };
-type ReportPayload = { date_from: string; date_to: string; total_rows: number; summary: ReportSummary[]; schedule?: { check_out: string; grace_minutes: number } };
+type ReportRow = { attendance_id: string; date: string; action: string; user_name?: string; user_email?: string; department?: string; distance_meters?: number; office_name?: string; created_at?: string; has_photo?: boolean };
+type ReportPayload = { date_from: string; date_to: string; total_rows: number; summary: ReportSummary[]; rows: ReportRow[]; schedule?: { check_out: string; grace_minutes: number } };
+type StatsDay = { date: string; on_time: number; late: number; on_leave: number; holiday: boolean };
+type StatsPayload = { year: number; month: number; schedule: { check_in: string; grace_minutes: number }; totals: { on_time: number; late: number; on_leave: number; days_in_month: number }; days: StatsDay[] };
 
 // Frontend contract: EXPO_PUBLIC_BACKEND_URL is supplied by frontend/.env.
 const backendUrl = ((Constants.expoConfig?.extra as { backendUrl?: string } | undefined)?.backendUrl || process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/\/$/, "");
@@ -148,6 +155,7 @@ function HomeScreen({ dashboard, onRefresh, onOpenCapture }: { dashboard: Dashbo
   const nearestOffice = offices.find((o) => o.office_name === nearestName) || offices[0];
   const inRange = distance !== null && nearestOffice ? distance <= nearestOffice.radius_meters : false;
   const holiday = dashboard?.holiday;
+  const onLeave = dashboard?.on_leave || null;
   // Compute lateness if today has a check-in record past scheduled check_in + grace
   const scheduledCheckIn = dashboard?.schedule.check_in || "08:00";
   const graceMinutes = dashboard?.schedule.grace_minutes ?? 0;
@@ -160,8 +168,10 @@ function HomeScreen({ dashboard, onRefresh, onOpenCapture }: { dashboard: Dashbo
     const actualStart = created.getHours() * 60 + created.getMinutes();
     if (actualStart > scheduledStart) lateMinutes = actualStart - scheduledStart;
   }
+  const captureDisabled = !inRange || locating || !!onLeave;
   return <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 32 }]} showsVerticalScrollIndicator={false}>
     <View style={styles.headerRow}><View><Text style={styles.greeting}>Good day</Text><Text style={styles.heading}>{dashboard?.user.name || "Your workspace"}</Text></View><View style={styles.avatar}><Text style={styles.avatarText}>{initials(dashboard?.user.name || "PK")}</Text></View></View>
+    {!!onLeave && <View testID="on-leave-banner" style={styles.leaveBanner}><Ionicons name="airplane" size={18} color="#1D4ED8" /><Text style={styles.leaveText}>You are on approved leave until {onLeave.end_date}. Attendance is not required today.</Text></View>}
     {!!holiday && <View testID="holiday-banner" style={styles.holidayBanner}><Ionicons name="sparkles" size={18} color="#B45309" /><Text style={styles.holidayText}>Today is a holiday · {holiday.label}. Attendance is optional.</Text></View>}
     {lateMinutes > 0 && <View testID="late-banner" style={styles.lateBanner}><Ionicons name="time-outline" size={18} color="#B91C1C" /><Text style={styles.lateText}>You checked in {lateMinutes} min after the scheduled {scheduledCheckIn}. Try to arrive on time tomorrow.</Text></View>}
     <View style={styles.liveCard}><View style={styles.cardTop}><View><Text style={styles.cardKicker}>TODAY’S ATTENDANCE</Text><Text style={styles.cardTitle}>{completed ? `Checked ${completed === "check_in" ? "in" : "out"}` : "Ready when you are"}</Text></View><StatusPill label={completed ? "Recorded" : "Not started"} tone={completed ? "success" : "neutral"} /></View><View style={styles.rule} /><View style={styles.scheduleRow}><View><Text style={styles.miniLabel}>SHIFT</Text><Text style={styles.scheduleValue}>{dashboard?.schedule.check_in || "08:00"} — {dashboard?.schedule.check_out || "17:00"}</Text></View><View style={styles.scheduleDivider} /><View><Text style={styles.miniLabel}>NEAREST OFFICE</Text><Text style={styles.scheduleValue}>{nearestOffice?.office_name || "—"}</Text></View></View></View>
@@ -169,7 +179,7 @@ function HomeScreen({ dashboard, onRefresh, onOpenCapture }: { dashboard: Dashbo
     <View style={styles.verifyCard}><View style={styles.verifyIcon}><Ionicons name="location" size={21} color="#DC2626" /></View><View style={styles.verifyCopy}><Text style={styles.verifyTitle}>Office location</Text><Text style={styles.verifySub}>{locating ? locationState : distance === null ? locationState : `${distance}m away · ${locationState}`}</Text></View>{locating ? <ActivityIndicator color="#DC2626" /> : <Ionicons name={inRange ? "checkmark-circle" : "alert-circle"} size={22} color={inRange ? "#16A34A" : "#CA8A04"} />}</View>
     <View style={styles.verifyCard}><View style={styles.verifyIcon}><Ionicons name="videocam" size={21} color="#DC2626" /></View><View style={styles.verifyCopy}><Text style={styles.verifyTitle}>Face liveness (video)</Text><Text style={styles.verifySub}>Record a short video and follow on-screen prompts</Text></View><Ionicons name="shield-checkmark-outline" size={22} color="#16A34A" /></View>
     <Text style={styles.helper}>You must be within {nearestOffice?.radius_meters || 100}m of an active office to record attendance.</Text>
-    <View style={styles.actionArea}><Pressable testID="attendance-primary-button" onPress={() => onOpenCapture(canCheckIn ? "check_in" : "check_out")} disabled={!inRange || locating} style={({ pressed }) => [styles.primaryButton, (pressed && styles.pressed), (!inRange || locating) && styles.disabled]}><Ionicons name={canCheckIn ? "log-in-outline" : "log-out-outline"} size={22} color="#fff" /><Text style={styles.primaryButtonText}>{canCheckIn ? "Check in now" : "Check out now"}</Text></Pressable><Text style={styles.actionCaption}>{!inRange ? "Waiting for a valid office location" : "Camera video and location will be checked"}</Text></View>
+    <View style={styles.actionArea}><Pressable testID="attendance-primary-button" onPress={() => onOpenCapture(canCheckIn ? "check_in" : "check_out")} disabled={captureDisabled} style={({ pressed }) => [styles.primaryButton, (pressed && styles.pressed), captureDisabled && styles.disabled]}><Ionicons name={canCheckIn ? "log-in-outline" : "log-out-outline"} size={22} color="#fff" /><Text style={styles.primaryButtonText}>{canCheckIn ? "Check in now" : "Check out now"}</Text></Pressable><Text style={styles.actionCaption}>{onLeave ? "You're on leave, no attendance needed" : !inRange ? "Waiting for a valid office location" : "Camera video and location will be checked"}</Text></View>
   </ScrollView>;
 }
 
@@ -318,7 +328,7 @@ function OnboardingScreen({ user, token, onDone }: { user: User; token: string; 
 
 // ------------------ Admin -------------------------------------------------------
 
-type AdminTab = "access" | "offices" | "users" | "holidays" | "schedule" | "reports";
+type AdminTab = "access" | "offices" | "users" | "leaves" | "holidays" | "schedule" | "stats" | "reports";
 
 function AdminScreen({ token }: { token: string }) {
   const [overview, setOverview] = useState<AdminOverview | null>(null);
@@ -338,7 +348,7 @@ function AdminScreen({ token }: { token: string }) {
     try { await apiRequest(`/admin/requests/${id}/approve`, token, { method: "POST" }); setMessage("Admin request approved."); await load(); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not approve request"); }
   };
-  const tabs: [AdminTab, string][] = [["access", "Access"], ["offices", "Offices"], ["users", "Users"], ["schedule", "Schedule"], ["holidays", "Holidays"], ["reports", "Reports"]];
+  const tabs: [AdminTab, string][] = [["access", "Access"], ["offices", "Offices"], ["users", "Users"], ["leaves", "Leaves"], ["schedule", "Schedule"], ["holidays", "Holidays"], ["stats", "Stats"], ["reports", "Reports"]];
   return <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.flex}>
     <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 30 }]}>
       <Text style={styles.heading}>Admin controls</Text>
@@ -354,8 +364,10 @@ function AdminScreen({ token }: { token: string }) {
       {tab === "access" && <AccessTab overview={overview} onApprove={approve} />}
       {tab === "offices" && <OfficesTab token={token} overview={overview} onChange={load} onMessage={setMessage} />}
       {tab === "users" && <UsersTab token={token} onMessage={setMessage} />}
+      {tab === "leaves" && <LeavesAdminTab token={token} onMessage={setMessage} />}
       {tab === "schedule" && <ScheduleTab token={token} overview={overview} onChange={load} onMessage={setMessage} />}
       {tab === "holidays" && <HolidaysTab token={token} overview={overview} onChange={load} onMessage={setMessage} />}
+      {tab === "stats" && <StatsTab token={token} />}
       {tab === "reports" && <ReportsTab token={token} />}
     </ScrollView>
   </KeyboardAvoidingView>;
@@ -568,6 +580,125 @@ function UsersTab({ token, onMessage }: { token: string; onMessage: (msg: string
   })}</View>;
 }
 
+function LeavesAdminTab({ token, onMessage }: { token: string; onMessage: (msg: string) => void }) {
+  const [leaves, setLeaves] = useState<Leave[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<"pending" | "approved" | "rejected">("pending");
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { const data = await apiRequest<Leave[]>(`/admin/leaves?status=${filter}`, token); setLeaves(data); }
+    catch (err) { onMessage(err instanceof Error ? err.message : "Could not load leaves"); }
+    finally { setLoading(false); }
+  }, [token, filter, onMessage]);
+  useEffect(() => { load(); }, [load]);
+  const resolve = async (leaveId: string, action: "approve" | "reject") => {
+    setBusyId(leaveId);
+    try { await apiRequest(`/admin/leaves/${leaveId}/${action}`, token, { method: "POST" }); onMessage(`Leave ${action}d.`); await load(); }
+    catch (err) { onMessage(err instanceof Error ? err.message : `Could not ${action} leave`); }
+    finally { setBusyId(null); }
+  };
+  const filters: ("pending" | "approved" | "rejected")[] = ["pending", "approved", "rejected"];
+  return <View>
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.segmentedScroll}>
+      {filters.map((f) => (
+        <Pressable testID={`leave-filter-${f}`} key={f} onPress={() => setFilter(f)} style={[styles.segmentChip, filter === f && styles.segmentChipActive]}>
+          <Text style={[styles.segmentText, filter === f && styles.segmentTextActive]}>{f.charAt(0).toUpperCase() + f.slice(1)}</Text>
+        </Pressable>
+      ))}
+    </ScrollView>
+    {loading && <ActivityIndicator color="#DC2626" style={{ marginTop: 16 }} />}
+    {!loading && leaves.length === 0 && (
+      <View style={styles.emptySmall}><Ionicons name="airplane-outline" size={25} color="#DC2626" /><Text style={styles.emptyTitle}>No {filter} leaves</Text><Text style={styles.emptyBody}>Requests appear here as employees submit them.</Text></View>
+    )}
+    {leaves.map((leave) => (
+      <View testID={`admin-leave-${leave.leave_id}`} style={styles.formCard} key={leave.leave_id}>
+        <Text style={styles.formTitle}>{leave.user_name || leave.user_email}</Text>
+        <Text style={styles.formHint}>{leave.department || "—"} · {leave.start_date} → {leave.end_date} · {leave.days} day(s)</Text>
+        <Text style={[styles.verifySub, { marginBottom: 8 }]}>{leave.reason}</Text>
+        {leave.status === "pending" ? (
+          <View style={styles.officeActions}>
+            <Pressable testID={`leave-approve-${leave.leave_id}`} onPress={() => resolve(leave.leave_id, "approve")} disabled={busyId === leave.leave_id} style={[styles.primaryButton, { flex: 1 }]}>
+              {busyId === leave.leave_id ? <ActivityIndicator color="#fff" /> : <><Ionicons name="checkmark" size={16} color="#fff" /><Text style={styles.primaryButtonText}>Approve</Text></>}
+            </Pressable>
+            <Pressable testID={`leave-reject-${leave.leave_id}`} onPress={() => resolve(leave.leave_id, "reject")} disabled={busyId === leave.leave_id} style={[styles.outlineButton, styles.dangerOutline, { flex: 1 }]}>
+              <Ionicons name="close" size={16} color="#B91C1C" /><Text style={[styles.outlineText, { color: "#B91C1C" }]}>Reject</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <View style={[styles.leaveStatus, leave.status === "approved" ? styles.statusApproved : styles.statusRejected]}>
+            <Text style={[styles.leaveStatusText, leave.status === "approved" ? { color: "#15803D" } : { color: "#991B1B" }]}>{leave.status.toUpperCase()}</Text>
+          </View>
+        )}
+      </View>
+    ))}
+  </View>;
+}
+
+function StatsTab({ token }: { token: string }) {
+  const now = new Date();
+  const [year, setYear] = useState(now.getFullYear());
+  const [month, setMonth] = useState(now.getMonth() + 1);
+  const [stats, setStats] = useState<StatsPayload | null>(null);
+  const [loading, setLoading] = useState(false);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { const data = await apiRequest<StatsPayload>(`/admin/stats?year=${year}&month=${month}`, token); setStats(data); }
+    catch {}
+    finally { setLoading(false); }
+  }, [token, year, month]);
+  useEffect(() => { load(); }, [load]);
+  const step = (delta: number) => {
+    let y = year, m = month + delta;
+    if (m < 1) { m = 12; y -= 1; }
+    if (m > 12) { m = 1; y += 1; }
+    setYear(y); setMonth(m);
+  };
+  const maxVal = stats ? Math.max(1, ...stats.days.map((d) => Math.max(d.on_time + d.late, d.on_leave))) : 1;
+  return <View>
+    <View style={styles.formCard}>
+      <View style={styles.officeRow}>
+        <Pressable testID="stats-prev-button" onPress={() => step(-1)} style={styles.outlineButton}><Ionicons name="chevron-back" size={16} color="#DC2626" /></Pressable>
+        <View style={{ flex: 1, alignItems: "center" }}>
+          <Text style={styles.formTitle}>{new Date(year, month - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" })}</Text>
+          <Text style={styles.formHint}>On-time vs late per day</Text>
+        </View>
+        <Pressable testID="stats-next-button" onPress={() => step(1)} style={styles.outlineButton}><Ionicons name="chevron-forward" size={16} color="#DC2626" /></Pressable>
+      </View>
+      {loading ? <ActivityIndicator color="#DC2626" style={{ marginTop: 16 }} /> : stats && <>
+        <View style={styles.statsTotalsRow}>
+          <View style={styles.statsTotal}><Text style={styles.statsTotalValue}>{stats.totals.on_time}</Text><Text style={styles.statsTotalLabel}>On time</Text></View>
+          <View style={styles.statsTotal}><Text style={[styles.statsTotalValue, { color: "#B91C1C" }]}>{stats.totals.late}</Text><Text style={styles.statsTotalLabel}>Late</Text></View>
+          <View style={styles.statsTotal}><Text style={[styles.statsTotalValue, { color: "#1D4ED8" }]}>{stats.totals.on_leave}</Text><Text style={styles.statsTotalLabel}>Leave</Text></View>
+        </View>
+        <View testID="stats-chart" style={styles.chart}>
+          {stats.days.map((day) => {
+            const dayNumber = parseInt(day.date.slice(8), 10);
+            const totalHeight = 100;
+            const onTimeH = Math.round((day.on_time / maxVal) * totalHeight);
+            const lateH = Math.round((day.late / maxVal) * totalHeight);
+            const leaveH = Math.round((day.on_leave / maxVal) * totalHeight);
+            return <View key={day.date} style={styles.chartCol}>
+              <View style={styles.chartBars}>
+                {leaveH > 0 && <View style={[styles.chartBar, { height: leaveH, backgroundColor: "#3B82F6" }]} />}
+                {lateH > 0 && <View style={[styles.chartBar, { height: lateH, backgroundColor: "#DC2626" }]} />}
+                {onTimeH > 0 && <View style={[styles.chartBar, { height: onTimeH, backgroundColor: "#16A34A" }]} />}
+              </View>
+              <Text style={[styles.chartLabel, day.holiday && { color: "#B45309" }]}>{dayNumber}</Text>
+            </View>;
+          })}
+        </View>
+        <View style={styles.chartLegend}>
+          <View style={styles.legendItem}><View style={[styles.legendDot, { backgroundColor: "#16A34A" }]} /><Text style={styles.legendText}>On time</Text></View>
+          <View style={styles.legendItem}><View style={[styles.legendDot, { backgroundColor: "#DC2626" }]} /><Text style={styles.legendText}>Late</Text></View>
+          <View style={styles.legendItem}><View style={[styles.legendDot, { backgroundColor: "#3B82F6" }]} /><Text style={styles.legendText}>On leave</Text></View>
+        </View>
+        <Text style={styles.formHint}>Grace period: check-in until {stats.schedule.check_in} (+{stats.schedule.grace_minutes}m) is on time.</Text>
+      </>}
+    </View>
+  </View>;
+}
+
 function ReportsTab({ token }: { token: string }) {
   const today = new Date().toISOString().slice(0, 10);
   const firstOfMonth = new Date().toISOString().slice(0, 8) + "01";
@@ -576,6 +707,9 @@ function ReportsTab({ token }: { token: string }) {
   const [report, setReport] = useState<ReportPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [photoRow, setPhotoRow] = useState<ReportRow | null>(null);
+  const [photoUri, setPhotoUri] = useState<string>("");
+  const [photoLoading, setPhotoLoading] = useState(false);
   const load = useCallback(async () => {
     setLoading(true); setError("");
     try {
@@ -654,6 +788,56 @@ function ReportsTab({ token }: { token: string }) {
         </View>
       </View>
     ))}
+    {report && report.rows.length > 0 && (
+      <View style={styles.formCard}>
+        <Text style={styles.formTitle}>All records ({report.rows.length})</Text>
+        <Text style={styles.formHint}>Tap any row to see the face proof photo captured at check-in.</Text>
+        {report.rows.slice(0, 50).map((row) => (
+          <Pressable
+            testID={`report-raw-${row.attendance_id}`}
+            key={row.attendance_id}
+            onPress={async () => {
+              if (!row.has_photo) return;
+              setPhotoRow(row); setPhotoUri(""); setPhotoLoading(true);
+              try {
+                const url = apiUrl(`/admin/attendance/${row.attendance_id}/photo`);
+                if (Platform.OS === "web") {
+                  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+                  if (!resp.ok) throw new Error("Photo unavailable");
+                  const blob = await resp.blob();
+                  setPhotoUri(window.URL.createObjectURL(blob));
+                } else {
+                  const target = `${FileSystem.cacheDirectory}proof-${row.attendance_id}.jpg`;
+                  const dl = await FileSystem.downloadAsync(url, target, { headers: { Authorization: `Bearer ${token}` } });
+                  if (dl.status !== 200) throw new Error("Photo unavailable");
+                  setPhotoUri(dl.uri);
+                }
+              } catch (err) {
+                setError(err instanceof Error ? err.message : "Photo unavailable");
+                setPhotoRow(null);
+              } finally { setPhotoLoading(false); }
+            }}
+            style={styles.rawRow}
+          >
+            <View style={{ flex: 1 }}>
+              <Text style={styles.verifyTitle}>{row.user_name || row.user_email || "—"}</Text>
+              <Text style={styles.verifySub}>{row.date} · {row.action === "check_in" ? "Check in" : "Check out"} · {row.office_name || "—"}</Text>
+            </View>
+            {row.has_photo ? <Ionicons name="image-outline" size={22} color="#DC2626" /> : <Ionicons name="image-outline" size={22} color="#D1D5DB" />}
+          </Pressable>
+        ))}
+      </View>
+    )}
+    <Modal visible={!!photoRow} transparent animationType="fade" onRequestClose={() => setPhotoRow(null)}>
+      <Pressable testID="photo-modal-backdrop" onPress={() => setPhotoRow(null)} style={styles.modalBackdrop}>
+        <Pressable style={styles.modalCard} onPress={() => {}}>
+          <Text style={styles.formTitle}>Face proof</Text>
+          <Text style={styles.formHint}>{photoRow?.user_name} · {photoRow?.date} · {photoRow?.action === "check_in" ? "Check in" : "Check out"}</Text>
+          {photoLoading ? <ActivityIndicator color="#DC2626" style={{ marginVertical: 30 }} /> : photoUri ? <Image testID="photo-modal-image" source={{ uri: photoUri }} style={styles.proofImage} resizeMode="cover" /> : <Text style={styles.formHint}>No photo</Text>}
+          <Pressable testID="photo-modal-close" onPress={() => setPhotoRow(null)} style={[styles.outlineButton, { marginTop: 12 }]}><Text style={styles.outlineText}>Close</Text></Pressable>
+        </Pressable>
+      </Pressable>
+    </Modal>
     {report && report.summary.length === 0 && !loading && (
       <View style={styles.emptySmall}><Ionicons name="bar-chart-outline" size={25} color="#DC2626" /><Text style={styles.emptyTitle}>No records in range</Text><Text style={styles.emptyBody}>Try widening the date window.</Text></View>
     )}
@@ -664,10 +848,122 @@ function Field({ label, value, onChangeText, keyboardType = "default" }: { label
   return <View style={styles.field}><Text style={styles.fieldLabel}>{label}</Text><TextInput value={value} onChangeText={onChangeText} keyboardType={keyboardType} style={styles.input} placeholderTextColor="#9CA3AF" /></View>;
 }
 
-function ProfileScreen({ user, token, onRequestAdmin, onLogout }: { user: User; token: string; onRequestAdmin: () => void; onLogout: () => void }) {
-  const insets = useSafeAreaInsets(); const [requestState, setRequestState] = useState("");
-  const request = async () => { try { const data = await apiRequest<{ message: string }>("/admin/request", token, { method: "POST" }); setRequestState(data.message); onRequestAdmin(); } catch (error) { setRequestState(error instanceof Error ? error.message : "Could not send request"); } };
-  return <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 30 }]}><Text style={styles.heading}>Profile</Text><Text style={styles.subheading}>Your verified PKUCity account</Text><View style={styles.profileCard}><View style={styles.avatarLarge}><Text style={styles.avatarLargeText}>{initials(user.name)}</Text></View><Text style={styles.profileName}>{user.name}</Text><Text style={styles.profileEmail}>{user.email}</Text><View style={styles.verifiedLabel}><Ionicons name="checkmark-circle" size={17} color="#16A34A" /><Text style={styles.verifiedText}>Google account verified</Text></View><View style={styles.roleBadge}><Text style={styles.roleText}>{user.role === "admin" ? "ADMIN" : "EMPLOYEE"}</Text></View></View>{user.role !== "admin" && <View style={styles.profileAction}><Text style={styles.formTitle}>Need more access?</Text><Text style={styles.formHint}>Request admin tools from an existing PKUCity administrator.</Text><Pressable testID="request-admin-button" onPress={request} style={styles.outlineButton}><Ionicons name="key-outline" size={19} color="#DC2626" /><Text style={styles.outlineText}>Request admin access</Text></Pressable>{!!requestState && <Text style={styles.requestState}>{requestState}</Text>}</View>}<Pressable testID="logout-button" onPress={onLogout} style={styles.logoutButton}><Ionicons name="log-out-outline" size={20} color="#DC2626" /><Text style={styles.logoutText}>Sign out</Text></Pressable></ScrollView>;
+function AvatarView({ user, size = 82 }: { user: User; size?: number }) {
+  if (user.avatar && user.avatar.startsWith("data:")) {
+    return <Image testID="profile-avatar-img" source={{ uri: user.avatar }} style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: "#FEE2E2" }} />;
+  }
+  return <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: "#FEE2E2", alignItems: "center", justifyContent: "center" }}>
+    <Text style={{ color: "#991B1B", fontSize: size / 3, fontWeight: "800" }}>{initials(user.full_name || user.name)}</Text>
+  </View>;
+}
+
+function ProfileScreen({ user, token, onRequestAdmin, onLogout, onUserChange }: { user: User; token: string; onRequestAdmin: () => void; onLogout: () => void; onUserChange: (u: User) => void }) {
+  const insets = useSafeAreaInsets();
+  const [requestState, setRequestState] = useState("");
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const [leaves, setLeaves] = useState<Leave[]>([]);
+  const [showLeaveForm, setShowLeaveForm] = useState(false);
+  const [leaveForm, setLeaveForm] = useState({ start_date: "", end_date: "", reason: "" });
+  const [leaveBusy, setLeaveBusy] = useState(false);
+  const [leaveError, setLeaveError] = useState("");
+  const request = async () => {
+    try { const data = await apiRequest<{ message: string }>("/admin/request", token, { method: "POST" }); setRequestState(data.message); onRequestAdmin(); }
+    catch (error) { setRequestState(error instanceof Error ? error.message : "Could not send request"); }
+  };
+  const loadLeaves = useCallback(async () => {
+    try { const data = await apiRequest<Leave[]>("/leaves", token); setLeaves(data); } catch {}
+  }, [token]);
+  useEffect(() => { loadLeaves(); }, [loadLeaves]);
+  const pickAvatar = async () => {
+    setAvatarBusy(true);
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) { setRequestState("Photo library permission denied"); return; }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.5,
+        base64: true,
+      });
+      if (result.canceled || !result.assets?.[0]?.base64) return;
+      const dataUrl = `data:image/jpeg;base64,${result.assets[0].base64}`;
+      const updated = await apiRequest<User>("/profile/avatar", token, { method: "PATCH", body: JSON.stringify({ image_base64: dataUrl }) });
+      onUserChange(updated);
+      setRequestState("Profile photo updated.");
+    } catch (err) {
+      setRequestState(err instanceof Error ? err.message : "Could not update photo");
+    } finally { setAvatarBusy(false); }
+  };
+  const submitLeave = async () => {
+    if (!leaveForm.start_date || !leaveForm.end_date || !leaveForm.reason) { setLeaveError("All fields are required"); return; }
+    setLeaveBusy(true); setLeaveError("");
+    try {
+      await apiRequest("/leaves", token, { method: "POST", body: JSON.stringify(leaveForm) });
+      setLeaveForm({ start_date: "", end_date: "", reason: "" });
+      setShowLeaveForm(false);
+      await loadLeaves();
+    } catch (err) { setLeaveError(err instanceof Error ? err.message : "Could not submit leave"); }
+    finally { setLeaveBusy(false); }
+  };
+  return <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.flex}>
+    <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 30 }]} keyboardShouldPersistTaps="handled">
+      <Text style={styles.heading}>Profile</Text>
+      <Text style={styles.subheading}>Your verified PKUCity account</Text>
+      <View style={styles.profileCard}>
+        <Pressable testID="avatar-change-button" onPress={pickAvatar} disabled={avatarBusy} style={{ marginBottom: 15 }}>
+          <AvatarView user={user} size={92} />
+          <View style={styles.avatarEdit}>{avatarBusy ? <ActivityIndicator color="#fff" /> : <Ionicons name="camera" size={16} color="#fff" />}</View>
+        </Pressable>
+        <Text style={styles.profileName}>{user.full_name || user.name}</Text>
+        <Text style={styles.profileEmail}>{user.email}</Text>
+        {!!user.department && <Text style={styles.profileEmail}>{user.department}</Text>}
+        <View style={styles.verifiedLabel}><Ionicons name="checkmark-circle" size={17} color="#16A34A" /><Text style={styles.verifiedText}>Google account verified</Text></View>
+        <View style={styles.roleBadge}><Text style={styles.roleText}>{user.role === "admin" ? "ADMIN" : "EMPLOYEE"}</Text></View>
+      </View>
+      {/* Leaves */}
+      <View style={styles.profileAction}>
+        <View style={styles.officeRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.formTitle}>My leave requests</Text>
+            <Text style={styles.formHint}>Approved leaves excuse attendance for those dates.</Text>
+          </View>
+          <Pressable testID="leave-new-button" onPress={() => setShowLeaveForm((s) => !s)} style={styles.approve}><Text style={styles.approveText}>{showLeaveForm ? "Close" : "New"}</Text></Pressable>
+        </View>
+        {showLeaveForm && <View style={{ marginTop: 10 }}>
+          <Field label="Start date (YYYY-MM-DD)" value={leaveForm.start_date} onChangeText={(v) => setLeaveForm({ ...leaveForm, start_date: v })} />
+          <Field label="End date (YYYY-MM-DD)" value={leaveForm.end_date} onChangeText={(v) => setLeaveForm({ ...leaveForm, end_date: v })} />
+          <Field label="Reason" value={leaveForm.reason} onChangeText={(v) => setLeaveForm({ ...leaveForm, reason: v })} />
+          {!!leaveError && <Text style={styles.captureNoticeError}>{leaveError}</Text>}
+          <Pressable testID="leave-submit-button" onPress={submitLeave} disabled={leaveBusy} style={[styles.primaryButton, { marginTop: 4 }]}>
+            {leaveBusy ? <ActivityIndicator color="#fff" /> : <><Ionicons name="paper-plane-outline" size={16} color="#fff" /><Text style={styles.primaryButtonText}>Submit leave</Text></>}
+          </Pressable>
+        </View>}
+        {leaves.map((leave) => (
+          <View testID={`leave-item-${leave.leave_id}`} style={styles.leaveItem} key={leave.leave_id}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.verifyTitle}>{leave.start_date} → {leave.end_date} · {leave.days}d</Text>
+              <Text style={styles.verifySub}>{leave.reason}</Text>
+            </View>
+            <View style={[styles.leaveStatus, leave.status === "approved" ? styles.statusApproved : leave.status === "rejected" ? styles.statusRejected : styles.statusPending]}>
+              <Text style={[styles.leaveStatusText, leave.status === "approved" ? { color: "#15803D" } : leave.status === "rejected" ? { color: "#991B1B" } : { color: "#A16207" }]}>{leave.status.toUpperCase()}</Text>
+            </View>
+          </View>
+        ))}
+        {leaves.length === 0 && !showLeaveForm && <Text style={styles.formHint}>You have no leave requests yet.</Text>}
+      </View>
+      {user.role !== "admin" && (
+        <View style={styles.profileAction}>
+          <Text style={styles.formTitle}>Need more access?</Text>
+          <Text style={styles.formHint}>Request admin tools from an existing PKUCity administrator.</Text>
+          <Pressable testID="request-admin-button" onPress={request} style={styles.outlineButton}><Ionicons name="key-outline" size={19} color="#DC2626" /><Text style={styles.outlineText}>Request admin access</Text></Pressable>
+          {!!requestState && <Text style={styles.requestState}>{requestState}</Text>}
+        </View>
+      )}
+      {user.role === "admin" && !!requestState && <Text style={styles.requestState}>{requestState}</Text>}
+      <Pressable testID="logout-button" onPress={onLogout} style={styles.logoutButton}><Ionicons name="log-out-outline" size={20} color="#DC2626" /><Text style={styles.logoutText}>Sign out</Text></Pressable>
+    </ScrollView>
+  </KeyboardAvoidingView>;
 }
 
 function BottomBar({ active, onChange, isAdmin }: { active: string; onChange: (value: string) => void; isAdmin: boolean }) {
@@ -688,7 +984,7 @@ export default function Index() {
   if (authState === "signed_out" || !user) return <AuthScreen onLogin={login} busy={authBusy} error={authError} />;
   if (!user.profile_complete) return <OnboardingScreen user={user} token={token} onDone={(updated) => setUser(updated)} />;
   if (captureAction) return <CaptureScreen action={captureAction} token={token} onDone={done} onCancel={() => setCaptureAction(null)} />;
-  return <View style={[styles.root, { paddingBottom: insets.bottom }]}>{active === "home" && <HomeScreen dashboard={dashboard} onRefresh={refresh} onOpenCapture={setCaptureAction} />}{active === "history" && <HistoryScreen records={records} loading={!records} />}{active === "admin" && user.role === "admin" && <AdminScreen token={token} />}{active === "profile" && <ProfileScreen user={user} token={token} onRequestAdmin={() => setActive("profile")} onLogout={signOut} />}<BottomBar active={active} onChange={setActive} isAdmin={user.role === "admin"} /></View>;
+  return <View style={[styles.root, { paddingBottom: insets.bottom }]}>{active === "home" && <HomeScreen dashboard={dashboard} onRefresh={refresh} onOpenCapture={setCaptureAction} />}{active === "history" && <HistoryScreen records={records} loading={!records} />}{active === "admin" && user.role === "admin" && <AdminScreen token={token} />}{active === "profile" && <ProfileScreen user={user} token={token} onRequestAdmin={() => setActive("profile")} onLogout={signOut} onUserChange={setUser} />}<BottomBar active={active} onChange={setActive} isAdmin={user.role === "admin"} /></View>;
 }
 
 const styles = StyleSheet.create({
@@ -861,4 +1157,30 @@ const styles = StyleSheet.create({
   mapHint: { color: "#6B7280", fontSize: 12, marginTop: 8, textAlign: "center" },
   mapNotice: { backgroundColor: "#FEF2F2", padding: 16, borderRadius: 14, alignItems: "center", gap: 8, marginBottom: 15 },
   mapNoticeText: { color: "#991B1B", fontSize: 12, textAlign: "center", lineHeight: 18 },
+  leaveBanner: { backgroundColor: "#DBEAFE", borderRadius: 12, padding: 12, flexDirection: "row", gap: 8, alignItems: "center", marginBottom: 16 },
+  leaveText: { color: "#1E40AF", fontSize: 12, flex: 1, fontWeight: "700" },
+  avatarEdit: { position: "absolute", right: -2, bottom: -2, width: 30, height: 30, borderRadius: 15, backgroundColor: "#DC2626", alignItems: "center", justifyContent: "center", borderWidth: 3, borderColor: "#fff" },
+  leaveItem: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, borderTopWidth: 1, borderTopColor: "#F3F4F6" },
+  leaveStatus: { alignSelf: "flex-start", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, marginTop: 6 },
+  leaveStatusText: { fontSize: 10, fontWeight: "800", letterSpacing: 0.8 },
+  statusApproved: { backgroundColor: "#DCFCE7" },
+  statusRejected: { backgroundColor: "#FEE2E2" },
+  statusPending: { backgroundColor: "#FEF3C7" },
+  statsTotalsRow: { flexDirection: "row", gap: 10, marginVertical: 12 },
+  statsTotal: { flex: 1, backgroundColor: "#F9FAFB", borderRadius: 12, padding: 12, alignItems: "center" },
+  statsTotalValue: { color: "#16A34A", fontSize: 22, fontWeight: "800" },
+  statsTotalLabel: { color: "#6B7280", fontSize: 11, fontWeight: "700", marginTop: 2, letterSpacing: 0.5 },
+  chart: { flexDirection: "row", alignItems: "flex-end", height: 140, gap: 3, marginTop: 8 },
+  chartCol: { flex: 1, alignItems: "center" },
+  chartBars: { height: 108, width: "100%", justifyContent: "flex-end", flexDirection: "column-reverse", gap: 1 },
+  chartBar: { width: "100%", borderRadius: 2 },
+  chartLabel: { color: "#6B7280", fontSize: 9, marginTop: 4 },
+  chartLegend: { flexDirection: "row", justifyContent: "center", gap: 14, marginTop: 12, marginBottom: 8 },
+  legendItem: { flexDirection: "row", alignItems: "center", gap: 5 },
+  legendDot: { width: 10, height: 10, borderRadius: 5 },
+  legendText: { color: "#4B5563", fontSize: 11, fontWeight: "700" },
+  rawRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, borderTopWidth: 1, borderTopColor: "#F3F4F6" },
+  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)", alignItems: "center", justifyContent: "center", padding: 20 },
+  modalCard: { width: "100%", maxWidth: 400, backgroundColor: "#fff", borderRadius: 20, padding: 20 },
+  proofImage: { width: "100%", aspectRatio: 3 / 4, borderRadius: 14, marginTop: 12, backgroundColor: "#F3F4F6" },
 });

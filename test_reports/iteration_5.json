@@ -1,0 +1,52 @@
+{
+  "summary": "Backend-only iteration 5. Added /app/backend/tests/test_new_features.py covering the four new feature areas: (1) leaves employee+admin flow with dashboard on_leave excuse, (2) monthly stats endpoint (/api/admin/stats) shape/counts/on_time-vs-late boundary/on_leave increment, (3) profile avatar PATCH+GET with data-URL validation/size limit/404, and (4) attendance proof photo admin endpoint plus reports has_photo boolean + no base64 leak. 18/18 new tests pass. Full backend suite now 32/32 pass (14 previously + 18 new). Authenticated flows continue to be exercised by seeding users + user_sessions directly in test_database via motor since real Emergent Google OAuth cannot be minted. Verified: 08:15 with schedule 08:00+15 grace counts as on_time (boundary is inclusive), 08:20 counts as late; approved leave covering a day increments per_day.on_leave; admin attendance photo returns image/jpeg with FFD8 magic bytes; report rows expose has_photo:bool without leaking the base64 photo string; avatar rejects non-image data URL with 400 and >800KB payload with 413.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/admin/stats", "issue": "on_time/late classification uses UTC hour+minute of created_at against a schedule that is a bare HH:MM (implicitly local business time). If deployment timezone differs from schedule tz the classification will be off by the UTC offset — same tz caveat flagged in iteration_4."},
+      {"endpoint": "POST /api/leaves", "issue": "No overlap check: an employee can create multiple pending/approved leaves that overlap the same date. Not required by spec but worth noting."},
+      {"endpoint": "GET /api/admin/leaves", "issue": "Unknown status query values (e.g. ?status=foo) are silently ignored (returns all). Acceptable but consider 400 for clarity."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_backend_api.py",
+    "/app/backend/tests/test_api_regression.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_new_features.xml",
+    "/app/test_reports/iteration_5.json"
+  ],
+  "action_items": [
+    "Consider migrating FastAPI @app.on_event startup/shutdown to lifespan handlers (deprecation warnings on server.py:332 and :1205).",
+    "Normalize/document the timezone used for schedule times vs. attendance.created_at across /api/admin/reports (overtime) and /api/admin/stats (on_time vs late). Currently only correct when server tz == schedule tz == UTC.",
+    "Optional: enforce non-overlapping pending/approved leaves per user, and return 400 on unknown ?status= values in /api/admin/leaves.",
+    "server.py is now ~1207 lines. Split into routers (auth, attendance, admin, reports, leaves, avatar, liveness) — well past the 700-line guideline."
+  ],
+  "critical_code_review_comments": [
+    "server.py:1059-1064 get_active_leave_for_today correctly matches approved leaves with start_date<=today<=end_date using string comparison (safe because dates are YYYY-MM-DD).",
+    "server.py:1176 uses `actual <= scheduled_start_minutes` so the grace boundary (e.g. 08:15 with 08:00+15) is INCLUSIVE (on_time). Verified by test_admin_stats_shape_and_counts.",
+    "server.py:761-774 _report_rows strips `photo` before returning and sets has_photo boolean — verified no base64 tail leaks in JSON.",
+    "server.py:979-995 admin_attendance_photo correctly returns 404 when the attendance doc has no photo (short-circuits before base64 decode) and honors the data URL's declared media type.",
+    "server.py:1001-1010 avatar validation base64-decodes the payload and rejects >800KB after decoding — matches the spec. Tested.",
+    "server.py total length still ~1207 lines — above the 700-line guideline; refactor recommended."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_new_features.xml",
+    "/app/test_reports/iteration_5.json"
+  ],
+  "success_rate": {"backend": "100% (32/32 pytest cases pass; 18 new + 14 existing)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Per-test motor fixtures seed TEST_-prefixed users, user_sessions, leaves, and attendance docs and clean them up on teardown. stats_seed uses year=2099 month=6 to isolate from real data. The seeded_attendance and stats_seed fixtures mutate the global schedule doc and restore the previous value on teardown.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run all tests: cd /app/backend && EXPO_PUBLIC_BACKEND_URL=http://localhost:8001 python -m pytest tests/ -v. pytest.ini enforces -n 2 --dist loadscope; each test module is pinned to one worker so schedule/DB mutations in test_backend_api.py::seeded_attendance and test_new_features.py::stats_seed do not race. Real Emergent Google OAuth is still not mintable — authenticated tests seed user_sessions directly and pass Bearer tokens. Motor rebinding pattern in the db fixture (server.client = _new_client(); server.db = client[DB_NAME]) is required so create_session works under pytest-asyncio's per-test loop.",
+  "rca_of_issue": "No regression found in iteration 5. All four new feature areas (leaves, monthly stats, avatar, attendance photo + report has_photo) match the spec: leaves are auth-gated and admin-role-gated correctly; approve/reject flips status and returns 404 for unknown or already-resolved leaves; dashboard.on_leave surfaces the approved leave when the range covers today; /api/admin/stats returns days_in_month entries (30 for June 2099) with on_time/late/on_leave counts computed correctly at the 08:15 grace boundary; avatar endpoints validate data URL, decoded size, and 404 correctly; admin attendance photo endpoint returns raw JPEG bytes (FFD8) with image/jpeg; report rows expose has_photo:bool with the base64 photo string stripped from the response."
+}

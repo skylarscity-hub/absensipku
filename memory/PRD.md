@@ -42,6 +42,12 @@ Build a mobile attendance app where employees sign in with verified Google accou
 - **Monthly PDF report**: `GET /api/admin/reports/export.pdf` returns a one-page A4 PDF (via `reportlab`) with title, period, and per-employee table including overtime. Frontend downloads and shares via `expo-file-system` + `expo-sharing`.
 - **Late banner**: Home shows a red "You checked in N min after the scheduled HH:MM" banner if today's check-in is past `check_in + grace_minutes`.
 
+## Newest additions (2026-02 pt.4)
+- **Leave requests**: `POST /api/leaves`, `GET /api/leaves` (own), admin `GET /api/admin/leaves`, `POST /api/admin/leaves/{id}/approve`, `POST /api/admin/leaves/{id}/reject`. Dashboard now returns `on_leave` when the caller has an approved leave covering today; Home shows a blue "on leave" banner and hides the check-in button. Verified 6 pytest cases.
+- **Monthly stats**: `GET /api/admin/stats?year=YYYY&month=MM` returns per-day on_time / late / on_leave counts plus totals; the Admin **Stats** tab renders a stacked bar chart (green on-time, red late, blue leave) with month navigation.
+- **Profile avatar**: `PATCH /api/profile/avatar` accepts a data URL (rejects non-image and >800KB), stored as base64 on the user document. `GET /api/users/{id}/avatar` serves the raw bytes. Frontend uses `expo-image-picker` and renders via `<Image>`.
+- **Attendance proof photo**: `verify_liveness` now grabs the middle frame of the challenge video and saves a downscaled JPEG data URL in `liveness_results.snapshot`. On `POST /api/attendance` the snapshot is copied into the attendance record (`photo` field). `GET /api/admin/attendance/{id}/photo` streams the JPEG to admin. `/api/admin/reports` rows expose `has_photo:bool` without leaking the base64 payload; the Reports tab shows an "All records" list with a tap-through modal for the proof photo.
+
 ## Backlog
 - P1: Add employee roster / teams; per-team schedules; PDF export.
 - P2: Audit log filtering; org branding upload.
