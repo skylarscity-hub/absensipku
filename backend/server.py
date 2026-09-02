@@ -342,6 +342,8 @@ async def startup() -> None:
     await db.holidays.create_index("date", unique=True)
     await db.leaves.create_index("leave_id", unique=True)
     await db.leaves.create_index([("user_id", 1), ("status", 1)])
+    await db.notifications.create_index("notification_id", unique=True)
+    await db.notifications.create_index([("user_id", 1), ("read", 1), ("created_at", -1)])
     await ensure_default_office()
 
 
