@@ -1,0 +1,38 @@
+{
+  "summary": "Validated the public Expo preview and unauthenticated API behavior. Login screen renders at 390x844 with Google CTA and no console/runtime errors; API health is 200 and protected endpoints correctly return 401.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "AuthScreen",
+        "issue": "document scrollWidth exceeds viewport width at 390px, indicating horizontal overflow on the login screen (likely the absolutely positioned redOrb extending beyond the root).",
+        "testID": "",
+        "priority": "MEDIUM"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": ["/app/test_reports/iteration_1.json"],
+  "action_items": [
+    "Constrain or clip the AuthScreen decorative red orb so document scrollWidth matches the mobile viewport.",
+    "Add testID attributes to interactive controls (Google login, bottom tabs, camera permission/shutter, admin controls) to support reliable regression testing.",
+    "Use the configured EXPO_BACKEND_URL variable name (or explicitly document the EXPO_PUBLIC_BACKEND_URL choice) to match the integration contract."
+  ],
+  "critical_code_review_comments": [
+    "OAuth callback, authenticated dashboard, camera, attendance acceptance/rejection, history, profile, and admin flows could not be exercised because test_credentials.md contains no usable Google identity and no session token was supplied.",
+    "The implemented liveness check is a client-supplied fixed string (blink-and-smile), not production-grade face/liveness anti-spoof detection; report this limitation accurately.",
+    "AuthScreen and most Pressable controls do not expose testID values despite the mobile testing contract."
+  ],
+  "updated_files": ["/app/test_reports/iteration_1.json"],
+  "success_rate": {"backend": "100% of executed unauthenticated checks", "frontend": "90% of executed public checks"},
+  "seed_data_creation": "None",
+  "retest_needed": true,
+  "should_call_test_agent_after_fix": true,
+  "context_for_next_testing_agent": "Public preview: https://face-check-attend-2.preview.emergentagent.com. Login was visible at 390x844. Google OAuth and all authenticated flows remain unverified due to missing credentials/session.",
+  "rca_of_issue": "Reproduction: open the public preview at 390x844 and evaluate document.documentElement.scrollWidth > document.documentElement.clientWidth; result was true. AuthScreen places redOrb position absolute with right:-115 and no overflow clipping, allowing the decorative element to expand the web document horizontally."
+}

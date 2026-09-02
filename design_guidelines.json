@@ -1,0 +1,145 @@
+{
+  "app_name": "pkucity",
+  "personality": "1 iOS-Native Clean (Red & White Theme)",
+  "personality_one_liner": "A precise, clean iOS-native workforce attendance platform featuring secure Google authentication, real-time geofence verification, face liveness checks, and comprehensive admin controls.",
+  "color": {
+    "surface": "#FFFFFF",
+    "onSurface": "#111827",
+    "surfaceSecondary": "#F3F4F6",
+    "onSurfaceSecondary": "#374151",
+    "surfaceTertiary": "#E5E7EB",
+    "onSurfaceTertiary": "#4B5563",
+    "surfaceInverse": "#1F2937",
+    "onSurfaceInverse": "#F9FAFB",
+    "brand": "#DC2626",
+    "brandPrimary": "#DC2626",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#B91C1C",
+    "onBrandSecondary": "#FFFFFF",
+    "brandTertiary": "#FEE2E2",
+    "onBrandTertiary": "#991B1B",
+    "success": "#16A34A",
+    "onSuccess": "#FFFFFF",
+    "warning": "#CA8A04",
+    "onWarning": "#FFFFFF",
+    "error": "#DC2626",
+    "onError": "#FFFFFF",
+    "info": "#2563EB",
+    "onInfo": "#FFFFFF",
+    "border": "#E5E7EB",
+    "borderStrong": "#D1D5DB",
+    "divider": "#F3F4F6"
+  },
+  "typography": {
+    "displayFontFamily": "Plus Jakarta Sans",
+    "textFontFamily": "Geist",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous iOS vertical rhythm with clean spacing, comfortable hit targets, and safe area padding at screen roots.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": "1",
+  "navigation": "bottom_tabs",
+  "icon_set": "Ionicons",
+  "glassmorphism": {
+    "enabled": true,
+    "do's": [
+      "Use frosted glass headers and bottom tab bars over scrolling content",
+      "Ensure solid tinted contrast backing for text over translucent elements"
+    ],
+    "dont's": [
+      "Never blur form inputs or body text regions",
+      "Do not stack more than 2 blurred layers per screen"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Auth / Google Login",
+      "purpose": "Secure Google Sign-In with credential verification and access request state.",
+      "states": {
+        "loading": "Centered red activity indicator with verification status message",
+        "empty": "Clean sign-in card with Google branding and secure enterprise badge",
+        "error": "Banner alert showing authentication failure with a retry button"
+      },
+      "layout": "Centered hero layout with PT PKUCity red & white branding, prominent Google sign-in button, and secure auth verification status indicator."
+    },
+    {
+      "name": "Home / Attendance Check-In",
+      "purpose": "Primary check-in dashboard with real-time GPS geofence validation and face camera liveness capture.",
+      "states": {
+        "loading": "Skeleton card loader for today's shift status and location fix",
+        "empty": "Prompt to enable GPS and camera permissions for attendance",
+        "error": "GPS out-of-range or liveness check failed alert with troubleshooting guide"
+      },
+      "layout": "Top status card showing office distance & radius, live map preview placeholder, current shift schedule, and large sticky red primary check-in CTA."
+    },
+    {
+      "name": "Attendance History",
+      "purpose": "View past attendance logs, check-in timestamps, geolocation coordinates, and verification status.",
+      "states": {
+        "loading": "Vertical skeleton list rows matching punch record items",
+        "empty": "No attendance records illustration with prompt to clock in",
+        "error": "Failed to load history message with retry action"
+      },
+      "layout": "Date-grouped list of punch records with status pills (Success, Rejected - Geofence, Rejected - Liveness), check-in times, and location coordinates."
+    },
+    {
+      "name": "Admin Management",
+      "purpose": "Admin control center for managing work schedules, office geofence coordinates/radius, and admin role requests.",
+      "states": {
+        "loading": "Skeleton loaders for admin stats and pending requests",
+        "empty": "No pending access requests or schedule updates",
+        "error": "Failed to sync admin settings with retry CTA"
+      },
+      "layout": "Segmented administrative dashboard with tabs for Pending Access Approvals, Office Geofence Settings (lat/long/radius), and Weekly Schedule configuration."
+    },
+    {
+      "name": "Profile & Settings",
+      "purpose": "Employee profile, Google account info, admin access request submission, and app preferences.",
+      "states": {
+        "loading": "Profile header skeleton",
+        "empty": "Empty profile state placeholder",
+        "error": "Failed to load profile details"
+      },
+      "layout": "Card-based profile view with Google avatar, verified email, role badge (Employee / Admin), Request Admin Access button, and sign out."
+    }
+  ],
+  "images": {
+    "pkucity_logo": {
+      "url": "https://images.unsplash.com/photo-1744740614987-11ef7ab9f011?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxOTB8MHwxfHNlYXJjaHwyfHxyZWQlMjB3aGl0ZSUyMG1pbmltYWxಿಸ್ಟlMjBjb3Jwb3JhdGUlMjBsb2dvJTIwcG5nJTIwdHJhbnNwYXJlbnR8ZW58MHx8fHwxNzg4MzQ5MTM0fDA&ixlib=rb-4.1.0&q=85",
+      "alt": "PKUCity Corporate Logo"
+    }
+  },
+  "instructions_to_main_agent": "Ensure all screens adhere to the red and white PKUCity theme with clean iOS styling. Implement real-time geolocation geofence calculation against office coordinates, face liveness detection simulation via camera capture, Google Sign-In verification, and admin approval workflows. Keep touch targets >= 44x44pt and respect safe areas at all screen roots."
+}
