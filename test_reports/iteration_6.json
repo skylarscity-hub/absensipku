@@ -1,0 +1,54 @@
+{
+  "summary": "Backend-only iteration 6. Added /app/backend/tests/test_notifications.py (9 tests) covering the new in-app notifications feature: auth gating on all three notification endpoints, notification creation on POST /api/admin/leaves/{id}/approve (category=leave_approved, read=false, related_id=leave_id) and on /reject (category=leave_rejected), GET /api/notifications returns {unread,items} scoped to the caller with created_at desc sort, POST /api/notifications/{id}/read marks single unread and updates dashboard.unread_notifications, cross-user mark-read returns 403/404 without leaking and does not mutate the owner's row, unknown id returns 403/404, POST /api/notifications/read-all returns {marked:int} scoped to caller only and leaves other users' unread untouched, and read-all when nothing to mark returns {marked:0}. Full backend suite 41/41 pass (32 prior + 9 new). No regressions in leave approve/reject flows (still {status: approved|rejected} and 404 for unknown/already-resolved).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/notifications/{id}/read", "issue": "Returns 404 for both non-existent notification AND correctly-existing notification owned by another user. Behavior is acceptable (does not leak existence) but the error message 'Notification not found' is identical in both cases — could be considered a minor UX polish, not a bug."},
+      {"endpoint": "GET /api/notifications", "issue": "No pagination or since/limit params — the endpoint returns up to 200 hard-coded items. Fine for MVP but worth noting for long-lived users."},
+      {"endpoint": "server.py", "issue": "server.py is now ~1276 lines (up from 1207). Still well past the 700-line refactor guideline — split into routers is overdue."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_notifications.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_backend_api.py",
+    "/app/backend/tests/test_api_regression.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_notifications.xml",
+    "/app/test_reports/iteration_6.json"
+  ],
+  "action_items": [
+    "None blocking. Optional: refactor server.py into per-domain routers (auth, attendance, admin, reports, leaves, avatar, liveness, notifications) — file is ~1276 lines.",
+    "Optional: migrate FastAPI @app.on_event startup/shutdown to lifespan handlers (deprecation warnings on server.py:332 and :1273).",
+    "Optional: consider paginating GET /api/notifications and marking read-all with an idempotent 200 even on zero (already implemented — verified).",
+    "Optional but recommended: since this iteration also upgraded Expo SDK 54 -> 57 (frontend only, per problem statement), request a follow-up frontend-only test run to smoke the web preview / bundling."
+  ],
+  "critical_code_review_comments": [
+    "server.py:1110-1127 admin_approve_leave uses find_one_and_update with status:'pending' filter — idempotent (404 on second call) and only fires create_notification when the transition actually happened. Correct.",
+    "server.py:1130-1147 admin_reject_leave mirrors approve behavior. Correct.",
+    "server.py:1153-1165 create_notification is an in-process helper (not an endpoint) — no auth check needed and correct.",
+    "server.py:1168-1173 list_notifications scopes by user_id from the session and sorts created_at desc with .to_list(200). unread count is derived from the same doc slice (safe because slice starts from newest).",
+    "server.py:1176-1185 mark_notification_read uses ({notification_id, user_id}) filter — cross-user access safely returns 404 (verified by test_mark_read_wrong_owner_does_not_leak).",
+    "server.py:1188-1195 mark_all_read is scoped by user_id and read:false — returns modified_count. Cross-user isolation verified.",
+    "server.py:438 dashboard.unread_notifications derives from db.notifications.count_documents — always fresh, no denormalization drift.",
+    "server.py:345-346 notifications collection has proper unique index on notification_id and compound index (user_id, read, created_at desc) — good."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_notifications.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_notifications.xml",
+    "/app/test_reports/iteration_6.json"
+  ],
+  "success_rate": {"backend": "100% (41/41 pytest cases pass; 9 new notification + 32 existing)", "frontend": "not tested (backend-only request; frontend Expo SDK 54->57 upgrade should be smoke-tested in a follow-up)"},
+  "seed_data_creation": "Per-test motor fixtures seed TEST_-prefixed users, user_sessions, leaves, notifications and clean them on teardown. New fixture employee_ctx_2 adds a second employee for cross-user isolation assertions. All notification test data is scoped to the seeded user_ids so parallel workers don't collide (pytest.ini pins each module to a single worker via loadscope).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run all tests: cd /app/backend && EXPO_PUBLIC_BACKEND_URL=http://localhost:8001 python -m pytest tests/ -v. pytest.ini enforces -n 2 --dist loadscope; each test module pinned to one worker. Real Emergent Google OAuth still not mintable — authenticated tests seed user_sessions directly and pass Bearer tokens. Notifications live in db.notifications with unique index on notification_id and compound (user_id, read, created_at desc). No frontend testing was requested; the Expo SDK 54 -> 57 upgrade mentioned in the problem statement was NOT smoke-tested here.",
+  "rca_of_issue": "No regression. All notification acceptance criteria pass: (1) approve creates leave_approved notification for the leave owner with read=false and related_id=leave_id; (2) reject creates leave_rejected notification; (3) GET /api/notifications is auth-gated (401) and scoped to caller with created_at desc sort and returns {unread,items}; (4) mark-single-read updates dashboard.unread_notifications and cross-user access returns 404 without leaking or mutating; unknown id returns 404; 401 unauth; (5) read-all marks only caller's unread and returns {marked:int}; 401 unauth; (6) leave approve/reject still returns {status: approved|rejected} and 404 for unknown/already-resolved — all 32 prior tests still pass."
+}

@@ -34,7 +34,7 @@ type User = { user_id: string; email: string; name: string; role: "employee" | "
 type Office = { office_id: string; office_name: string; latitude: number; longitude: number; radius_meters: number; active: boolean };
 type Holiday = { holiday_id: string; date: string; label: string };
 type Leave = { leave_id: string; user_id: string; user_name?: string; user_email?: string; department?: string; start_date: string; end_date: string; days: number; reason: string; status: "pending" | "approved" | "rejected"; created_at?: string };
-type Dashboard = { user: User; settings: Office; offices: Office[]; schedule: { check_in: string; check_out: string; grace_minutes: number }; today?: { action?: string; created_at?: string }; holiday?: { label: string } | null; on_leave?: Leave | null };
+type Dashboard = { user: User; settings: Office; offices: Office[]; schedule: { check_in: string; check_out: string; grace_minutes: number }; today?: { action?: string; created_at?: string }; holiday?: { label: string } | null; on_leave?: Leave | null; unread_notifications?: number };
 type RecordItem = { attendance_id: string; date: string; action: string; distance_meters: number; verification: string; created_at: string; office_name?: string };
 type AdminOverview = { settings: Office; offices: Office[]; schedule: Dashboard["schedule"]; requests: { request_id: string; name: string; email: string }[]; holidays: Holiday[] };
 type LivenessSession = { liveness_session_id: string; steps: string[]; expires_in: number };
@@ -43,6 +43,8 @@ type ReportRow = { attendance_id: string; date: string; action: string; user_nam
 type ReportPayload = { date_from: string; date_to: string; total_rows: number; summary: ReportSummary[]; rows: ReportRow[]; schedule?: { check_out: string; grace_minutes: number } };
 type StatsDay = { date: string; on_time: number; late: number; on_leave: number; holiday: boolean };
 type StatsPayload = { year: number; month: number; schedule: { check_in: string; grace_minutes: number }; totals: { on_time: number; late: number; on_leave: number; days_in_month: number }; days: StatsDay[] };
+type Notification = { notification_id: string; title: string; body: string; category: string; related_id?: string; read: boolean; created_at: string };
+type NotificationList = { unread: number; items: Notification[] };
 
 // Frontend contract: EXPO_PUBLIC_BACKEND_URL is supplied by frontend/.env.
 const backendUrl = ((Constants.expoConfig?.extra as { backendUrl?: string } | undefined)?.backendUrl || process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/\/$/, "");
@@ -120,7 +122,7 @@ function StatusPill({ label, tone = "success" }: { label: string; tone?: "succes
   return <View style={[styles.statusPill, tone === "warning" ? styles.warningPill : tone === "neutral" ? styles.neutralPill : styles.successPill]}><View style={[styles.pillDot, tone === "warning" ? styles.warningDot : tone === "neutral" ? styles.neutralDot : styles.successDot]} /><Text style={[styles.pillText, tone === "warning" ? styles.warningText : tone === "neutral" ? styles.neutralText : styles.successText]}>{label}</Text></View>;
 }
 
-function HomeScreen({ dashboard, onRefresh, onOpenCapture }: { dashboard: Dashboard | null; onRefresh: () => void; onOpenCapture: (action: "check_in" | "check_out") => void }) {
+function HomeScreen({ dashboard, onRefresh, onOpenCapture, onOpenNotifications }: { dashboard: Dashboard | null; onRefresh: () => void; onOpenCapture: (action: "check_in" | "check_out") => void; onOpenNotifications: () => void }) {
   const [locationState, setLocationState] = useState("Finding your location…");
   const [distance, setDistance] = useState<number | null>(null);
   const [locating, setLocating] = useState(true);
@@ -170,7 +172,16 @@ function HomeScreen({ dashboard, onRefresh, onOpenCapture }: { dashboard: Dashbo
   }
   const captureDisabled = !inRange || locating || !!onLeave;
   return <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 20, paddingBottom: 32 }]} showsVerticalScrollIndicator={false}>
-    <View style={styles.headerRow}><View><Text style={styles.greeting}>Good day</Text><Text style={styles.heading}>{dashboard?.user.name || "Your workspace"}</Text></View><View style={styles.avatar}><Text style={styles.avatarText}>{initials(dashboard?.user.name || "PK")}</Text></View></View>
+    <View style={styles.headerRow}>
+      <View><Text style={styles.greeting}>Good day</Text><Text style={styles.heading}>{dashboard?.user.name || "Your workspace"}</Text></View>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+        <Pressable testID="notifications-bell-button" onPress={onOpenNotifications} style={styles.bellButton}>
+          <Ionicons name="notifications-outline" size={22} color="#111827" />
+          {(dashboard?.unread_notifications || 0) > 0 && <View testID="notifications-badge" style={styles.bellBadge}><Text style={styles.bellBadgeText}>{Math.min(dashboard?.unread_notifications || 0, 9)}</Text></View>}
+        </Pressable>
+        {dashboard?.user && <AvatarView user={dashboard.user} size={44} />}
+      </View>
+    </View>
     {!!onLeave && <View testID="on-leave-banner" style={styles.leaveBanner}><Ionicons name="airplane" size={18} color="#1D4ED8" /><Text style={styles.leaveText}>You are on approved leave until {onLeave.end_date}. Attendance is not required today.</Text></View>}
     {!!holiday && <View testID="holiday-banner" style={styles.holidayBanner}><Ionicons name="sparkles" size={18} color="#B45309" /><Text style={styles.holidayText}>Today is a holiday · {holiday.label}. Attendance is optional.</Text></View>}
     {lateMinutes > 0 && <View testID="late-banner" style={styles.lateBanner}><Ionicons name="time-outline" size={18} color="#B91C1C" /><Text style={styles.lateText}>You checked in {lateMinutes} min after the scheduled {scheduledCheckIn}. Try to arrive on time tomorrow.</Text></View>}
@@ -966,25 +977,80 @@ function ProfileScreen({ user, token, onRequestAdmin, onLogout, onUserChange }: 
   </KeyboardAvoidingView>;
 }
 
+function NotificationsModal({ visible, token, onClose, onChange }: { visible: boolean; token: string; onClose: () => void; onChange: () => void }) {
+  const [data, setData] = useState<NotificationList | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    setBusy(true);
+    try { const result = await apiRequest<NotificationList>("/notifications", token); setData(result); }
+    catch {}
+    finally { setBusy(false); }
+  }, [token]);
+  useEffect(() => { if (visible) load(); }, [visible, load]);
+  const markRead = async (id: string) => {
+    try { await apiRequest(`/notifications/${id}/read`, token, { method: "POST" }); await load(); onChange(); } catch {}
+  };
+  const markAll = async () => {
+    try { await apiRequest("/notifications/read-all", token, { method: "POST" }); await load(); onChange(); } catch {}
+  };
+  return <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Pressable testID="notifications-backdrop" onPress={onClose} style={styles.modalBackdrop}>
+      <Pressable style={[styles.modalCard, { maxHeight: "80%" }]} onPress={() => {}}>
+        <View style={styles.officeRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.formTitle}>Notifications</Text>
+            <Text style={styles.formHint}>{data?.unread ? `${data.unread} unread` : "You're all caught up"}</Text>
+          </View>
+          {(data?.unread || 0) > 0 && <Pressable testID="mark-all-read-button" onPress={markAll} style={styles.approve}><Text style={styles.approveText}>Mark all</Text></Pressable>}
+        </View>
+        <ScrollView style={{ marginTop: 12 }} contentContainerStyle={{ paddingBottom: 20 }}>
+          {busy && <ActivityIndicator color="#DC2626" style={{ marginVertical: 20 }} />}
+          {!busy && (data?.items.length || 0) === 0 && <View style={styles.emptySmall}><Ionicons name="notifications-off-outline" size={25} color="#DC2626" /><Text style={styles.emptyTitle}>No notifications</Text><Text style={styles.emptyBody}>Approvals and updates will appear here.</Text></View>}
+          {data?.items.map((item) => (
+            <Pressable testID={`notification-${item.notification_id}`} key={item.notification_id} onPress={() => !item.read && markRead(item.notification_id)} style={[styles.notifCard, !item.read && styles.notifUnread]}>
+              <View style={[styles.notifIcon, item.category === "leave_approved" ? { backgroundColor: "#DCFCE7" } : item.category === "leave_rejected" ? { backgroundColor: "#FEE2E2" } : { backgroundColor: "#FEF3C7" }]}>
+                <Ionicons name={item.category === "leave_approved" ? "checkmark-circle" : item.category === "leave_rejected" ? "close-circle" : "information-circle"} size={20} color={item.category === "leave_approved" ? "#16A34A" : item.category === "leave_rejected" ? "#B91C1C" : "#B45309"} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.verifyTitle}>{item.title}</Text>
+                <Text style={styles.verifySub}>{item.body}</Text>
+                <Text style={[styles.formHint, { marginTop: 4, marginBottom: 0 }]}>{new Date(item.created_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</Text>
+              </View>
+              {!item.read && <View style={styles.notifDot} />}
+            </Pressable>
+          ))}
+        </ScrollView>
+        <Pressable testID="notifications-close" onPress={onClose} style={[styles.outlineButton, { marginTop: 4 }]}><Text style={styles.outlineText}>Close</Text></Pressable>
+      </Pressable>
+    </Pressable>
+  </Modal>;
+}
+
 function BottomBar({ active, onChange, isAdmin }: { active: string; onChange: (value: string) => void; isAdmin: boolean }) {
   const tabs = [{ key: "home", label: "Home", icon: "home-outline" }, { key: "history", label: "History", icon: "time-outline" }, ...(isAdmin ? [{ key: "admin", label: "Admin", icon: "settings-outline" }] : []), { key: "profile", label: "Profile", icon: "person-outline" }];
   return <BlurView intensity={80} tint="light" style={styles.bottomBar}>{tabs.map((tab) => <Pressable testID={`tab-${tab.key}`} key={tab.key} onPress={() => onChange(tab.key)} style={({ pressed }) => [styles.tab, pressed && styles.pressed]}><Ionicons name={tab.icon as keyof typeof Ionicons.glyphMap} size={22} color={active === tab.key ? "#DC2626" : "#6B7280"} /><Text style={[styles.tabLabel, active === tab.key && styles.tabActive]}>{tab.label}</Text></Pressable>)}</BlurView>;
 }
 
 export default function Index() {
-  const [authState, setAuthState] = useState<"loading" | "signed_out" | "signed_in">("loading"); const [user, setUser] = useState<User | null>(null); const [token, setToken] = useState(""); const [authBusy, setAuthBusy] = useState(false); const [authError, setAuthError] = useState(""); const [dashboard, setDashboard] = useState<Dashboard | null>(null); const [records, setRecords] = useState<RecordItem[]>([]); const [active, setActive] = useState("home"); const [captureAction, setCaptureAction] = useState<"check_in" | "check_out" | null>(null); const insets = useSafeAreaInsets();
+  const [authState, setAuthState] = useState<"loading" | "signed_out" | "signed_in">("loading"); const [user, setUser] = useState<User | null>(null); const [token, setToken] = useState(""); const [authBusy, setAuthBusy] = useState(false); const [authError, setAuthError] = useState(""); const [dashboard, setDashboard] = useState<Dashboard | null>(null); const [records, setRecords] = useState<RecordItem[]>([]); const [active, setActive] = useState("home"); const [captureAction, setCaptureAction] = useState<"check_in" | "check_out" | null>(null); const [notifOpen, setNotifOpen] = useState(false); const insets = useSafeAreaInsets();
   const signOut = useCallback(async () => { await clearToken(); setToken(""); setUser(null); setDashboard(null); setAuthState("signed_out"); }, []);
   const loadApp = useCallback(async (sessionToken: string) => { try { const [me, home, history] = await Promise.all([apiRequest<User>("/auth/me", sessionToken), apiRequest<Dashboard>("/dashboard", sessionToken), apiRequest<RecordItem[]>("/attendance", sessionToken)]); setToken(sessionToken); setUser(me); setDashboard(home); setRecords(history); setAuthState("signed_in"); } catch (error) { await clearToken(); setAuthError(error instanceof Error ? error.message : "Session expired"); setAuthState("signed_out"); } }, []);
   const exchange = useCallback(async (sessionId: string) => { if (!sessionId || usedSessionIds.has(sessionId)) return; usedSessionIds.add(sessionId); setAuthBusy(true); setAuthError(""); try { const response = await fetch(apiUrl("/auth/session"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId }) }); if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || "Google verification failed"); const data = await response.json(); await saveToken(data.session_token); await loadApp(data.session_token); if (Platform.OS === "web") { const cleanUrl = window.location.href.replace(/([?#&])session_id=[^&#]+/, "").replace(/[?&]$/, ""); window.history.replaceState(window.history.state, "", cleanUrl); } } catch (error) { usedSessionIds.delete(sessionId); setAuthError(error instanceof Error ? error.message : "Google verification failed"); setAuthState("signed_out"); } finally { setAuthBusy(false); } }, [loadApp]);
   useEffect(() => { let mounted = true; const handleUrl = (url: string) => { const id = sessionIdFromUrl(url); if (id && mounted) exchange(id); }; const setup = async () => { const initial = Platform.OS === "web" ? window.location.href : await Linking.getInitialURL(); if (initial) handleUrl(initial); const existing = await readToken(); if (mounted && !sessionIdFromUrl(initial) && existing) await loadApp(existing); else if (mounted && !sessionIdFromUrl(initial)) setAuthState("signed_out"); if (Platform.OS !== "web") { const listener = Linking.addEventListener("url", (event) => handleUrl(event.url)); return () => listener.remove(); } }; let cleanup: (() => void) | undefined; setup().then((fn) => { cleanup = fn; }); return () => { mounted = false; cleanup?.(); }; }, [exchange, loadApp]);
   const login = async () => { setAuthBusy(true); setAuthError(""); try { const redirectUrl = Platform.OS === "web" ? `${window.location.origin}/` : Linking.createURL(""); const authUrl = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`; if (Platform.OS === "web") window.location.href = authUrl; else { let linkedUrl: string | null = null; const listener = Linking.addEventListener("url", (event) => { linkedUrl = event.url; }); const result = await WebBrowser.openAuthSessionAsync(authUrl, redirectUrl); listener.remove(); const callback = result.type === "success" ? result.url : linkedUrl || await Linking.getInitialURL(); const id = sessionIdFromUrl(callback); if (id) await exchange(id); else setAuthError("Google sign-in was cancelled."); } } catch (error) { setAuthError(error instanceof Error ? error.message : "Could not open Google sign-in"); setAuthBusy(false); } };
   const refresh = async () => { if (!token) return; try { const [home, history] = await Promise.all([apiRequest<Dashboard>("/dashboard", token), apiRequest<RecordItem[]>("/attendance", token)]); setDashboard(home); setRecords(history); } catch {} };
+  // Poll dashboard every 30s so notification badge stays fresh in-app.
+  useEffect(() => {
+    if (!token || authState !== "signed_in") return;
+    const interval = setInterval(() => { apiRequest<Dashboard>("/dashboard", token).then(setDashboard).catch(() => {}); }, 30000);
+    return () => clearInterval(interval);
+  }, [token, authState]);
   const done = (message: string) => { setCaptureAction(null); Alert.alert("Attendance verified", message); refresh(); };
   if (authState === "loading" || (authBusy && authState !== "signed_in")) return <LoadingScreen />;
   if (authState === "signed_out" || !user) return <AuthScreen onLogin={login} busy={authBusy} error={authError} />;
   if (!user.profile_complete) return <OnboardingScreen user={user} token={token} onDone={(updated) => setUser(updated)} />;
   if (captureAction) return <CaptureScreen action={captureAction} token={token} onDone={done} onCancel={() => setCaptureAction(null)} />;
-  return <View style={[styles.root, { paddingBottom: insets.bottom }]}>{active === "home" && <HomeScreen dashboard={dashboard} onRefresh={refresh} onOpenCapture={setCaptureAction} />}{active === "history" && <HistoryScreen records={records} loading={!records} />}{active === "admin" && user.role === "admin" && <AdminScreen token={token} />}{active === "profile" && <ProfileScreen user={user} token={token} onRequestAdmin={() => setActive("profile")} onLogout={signOut} onUserChange={setUser} />}<BottomBar active={active} onChange={setActive} isAdmin={user.role === "admin"} /></View>;
+  return <View style={[styles.root, { paddingBottom: insets.bottom }]}>{active === "home" && <HomeScreen dashboard={dashboard} onRefresh={refresh} onOpenCapture={setCaptureAction} onOpenNotifications={() => setNotifOpen(true)} />}{active === "history" && <HistoryScreen records={records} loading={!records} />}{active === "admin" && user.role === "admin" && <AdminScreen token={token} />}{active === "profile" && <ProfileScreen user={user} token={token} onRequestAdmin={() => setActive("profile")} onLogout={signOut} onUserChange={setUser} />}<BottomBar active={active} onChange={setActive} isAdmin={user.role === "admin"} /><NotificationsModal visible={notifOpen} token={token} onClose={() => setNotifOpen(false)} onChange={refresh} /></View>;
 }
 
 const styles = StyleSheet.create({
@@ -1183,4 +1249,11 @@ const styles = StyleSheet.create({
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)", alignItems: "center", justifyContent: "center", padding: 20 },
   modalCard: { width: "100%", maxWidth: 400, backgroundColor: "#fff", borderRadius: 20, padding: 20 },
   proofImage: { width: "100%", aspectRatio: 3 / 4, borderRadius: 14, marginTop: 12, backgroundColor: "#F3F4F6" },
+  bellButton: { width: 44, height: 44, borderRadius: 22, backgroundColor: "#FEE2E2", alignItems: "center", justifyContent: "center" },
+  bellBadge: { position: "absolute", top: 4, right: 4, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: "#DC2626", paddingHorizontal: 4, alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: "#fff" },
+  bellBadgeText: { color: "#fff", fontSize: 10, fontWeight: "800" },
+  notifCard: { flexDirection: "row", alignItems: "flex-start", gap: 12, padding: 12, marginBottom: 8, borderRadius: 14, backgroundColor: "#F9FAFB", borderWidth: 1, borderColor: "#F3F4F6" },
+  notifUnread: { backgroundColor: "#FEF2F2", borderColor: "#FCA5A5" },
+  notifIcon: { width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center" },
+  notifDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#DC2626", marginTop: 6 },
 });

@@ -435,6 +435,7 @@ async def dashboard(request: Request) -> Dict[str, Any]:
     holiday = await is_holiday(today)
     record = await db.attendance.find_one({"user_id": user["user_id"], "date": today}, {"_id": 0, "photo": 0}, sort=[("created_at", -1)])
     active_leave = await get_active_leave_for_today(user["user_id"], today)
+    unread_notifications = await db.notifications.count_documents({"user_id": user["user_id"], "read": False})
     # Legacy field "settings" kept for backward-compatible frontend keys (uses first active office).
     primary = offices[0] if offices else {"office_name": "PKUCity Office", "latitude": 0.0, "longitude": 0.0, "radius_meters": 100}
     return {
@@ -445,6 +446,7 @@ async def dashboard(request: Request) -> Dict[str, Any]:
         "today": clean(record),
         "holiday": clean(holiday) if holiday else None,
         "on_leave": active_leave,
+        "unread_notifications": unread_notifications,
         "server_time": now_utc(),
     }
 
@@ -1108,25 +1110,89 @@ async def admin_list_leaves(request: Request, status: Optional[str] = None) -> L
 @api_router.post("/admin/leaves/{leave_id}/approve")
 async def admin_approve_leave(leave_id: str, request: Request) -> Dict[str, str]:
     admin = await require_admin(request)
-    result = await db.leaves.update_one(
+    leave = await db.leaves.find_one_and_update(
         {"leave_id": leave_id, "status": "pending"},
         {"$set": {"status": "approved", "resolved_at": now_utc(), "resolved_by": admin["user_id"]}},
+        {"_id": 0},
     )
-    if result.matched_count == 0:
+    if not leave:
         raise HTTPException(status_code=404, detail="Leave not found or already resolved")
+    await create_notification(
+        user_id=leave["user_id"],
+        title="Leave approved",
+        body=f"Your leave from {leave['start_date']} to {leave['end_date']} has been approved. Enjoy!",
+        category="leave_approved",
+        related_id=leave_id,
+    )
     return {"status": "approved"}
 
 
 @api_router.post("/admin/leaves/{leave_id}/reject")
 async def admin_reject_leave(leave_id: str, request: Request) -> Dict[str, str]:
     admin = await require_admin(request)
-    result = await db.leaves.update_one(
+    leave = await db.leaves.find_one_and_update(
         {"leave_id": leave_id, "status": "pending"},
         {"$set": {"status": "rejected", "resolved_at": now_utc(), "resolved_by": admin["user_id"]}},
+        {"_id": 0},
+    )
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found or already resolved")
+    await create_notification(
+        user_id=leave["user_id"],
+        title="Leave rejected",
+        body=f"Your leave from {leave['start_date']} to {leave['end_date']} was rejected. Contact your admin for details.",
+        category="leave_rejected",
+        related_id=leave_id,
+    )
+    return {"status": "rejected"}
+
+
+# ---- Notifications --------------------------------------------------------------
+
+
+async def create_notification(user_id: str, title: str, body: str, category: str, related_id: Optional[str] = None) -> Dict[str, Any]:
+    doc = {
+        "notification_id": f"ntf_{uuid.uuid4().hex[:12]}",
+        "user_id": user_id,
+        "title": title,
+        "body": body,
+        "category": category,
+        "related_id": related_id,
+        "read": False,
+        "created_at": now_utc(),
+    }
+    await db.notifications.insert_one(dict(doc))
+    return clean(doc)
+
+
+@api_router.get("/notifications")
+async def list_notifications(request: Request) -> Dict[str, Any]:
+    user = await get_current_user(request)
+    docs = await db.notifications.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    unread = sum(1 for doc in docs if not doc.get("read"))
+    return {"unread": unread, "items": [clean(doc) for doc in docs]}
+
+
+@api_router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, request: Request) -> Dict[str, str]:
+    user = await get_current_user(request)
+    result = await db.notifications.update_one(
+        {"notification_id": notification_id, "user_id": user["user_id"]},
+        {"$set": {"read": True, "read_at": now_utc()}},
     )
     if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Leave not found or already resolved")
-    return {"status": "rejected"}
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"status": "read"}
+
+
+@api_router.post("/notifications/read-all")
+async def mark_all_read(request: Request) -> Dict[str, int]:
+    user = await get_current_user(request)
+    result = await db.notifications.update_many(
+        {"user_id": user["user_id"], "read": False},
+        {"$set": {"read": True, "read_at": now_utc()}},
+    )
+    return {"marked": result.modified_count}
 
 
 # ---- Monthly stats --------------------------------------------------------------
