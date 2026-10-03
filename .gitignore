@@ -81,3 +81,4 @@ memory/test_credentials.md
 # Mobile development
 android-sdk/project.zip
 project.zip
+venv/lib/python3.11/site-packages/mediapipe/tasks/c/libmediapipe.so

@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "pkucity",
-    "slug": "pkucity",
+    "name": "PKUCITY",
+    "slug": "PKUCITY",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -20,6 +20,7 @@
     "android": {
       "permissions": [
         "CAMERA",
+        "RECORD_AUDIO",
         "ACCESS_COARSE_LOCATION",
         "ACCESS_FINE_LOCATION"
       ],
