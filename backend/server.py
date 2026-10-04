@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from motor.motor_asyncio import AsyncIOMotorClient
+from supabase_db import SupabaseDatabase
 from pydantic import BaseModel, ConfigDict, Field
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -33,9 +33,12 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip()
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+if not SUPABASE_SECRET_KEY:
+    raise RuntimeError("SUPABASE_SECRET_KEY belum dikonfigurasi di backend/.env")
+db = SupabaseDatabase(SUPABASE_URL, SUPABASE_SECRET_KEY)
 app = FastAPI(title="PKUCity Attendance API")
 api_router = APIRouter(prefix="/api")
 logger = logging.getLogger("pkucity")
@@ -822,10 +825,6 @@ def verify_password(password: str, stored: Optional[str]) -> bool:
         return secrets.compare_digest(actual, expected)
     except Exception:
         return False
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://tzgpmpiavwnealdtjnub.supabase.co").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip()
-
 
 async def get_supabase_user(access_token: str) -> Dict[str, Any]:
     if not SUPABASE_ANON_KEY:
@@ -4582,4 +4581,4 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client() -> None:
     await _push_client.aclose()
-    client.close()
+    await db.close()
