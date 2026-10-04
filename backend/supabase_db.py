@@ -141,7 +141,7 @@ class SupabaseDatabase:
 
     def __init__(self, url, key):
         self.url=url.rstrip("/"); self.key=key
-        self.client=httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10), headers={"apikey":key,"Authorization":f"Bearer {key}","Content-Type":"application/json"})
+        self.client=httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10), headers={"apikey":key,"Content-Type":"application/json"})
 
     def __getattr__(self, name):
         if name.startswith("_"): raise AttributeError(name)
