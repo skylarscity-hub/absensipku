@@ -27,6 +27,7 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { supabase } from "../lib/supabase";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -304,7 +305,20 @@ function translateUiMessage(message?: string | null) {
 }
 
 async function apiRequest<T>(path: string, token: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(apiUrl(path), { ...options, headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...(options.headers || {}) } });
+  let bearer = token;
+  try {
+    const { data } = await supabase.auth.getSession();
+    if (data.session?.access_token) bearer = data.session.access_token;
+  } catch {}
+
+  const response = await fetch(apiUrl(path), {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${bearer}`,
+      ...(options.headers || {}),
+    },
+  });
   if (!response.ok) throw new Error(translateUiMessage((await response.json().catch(() => null))?.detail || "Terjadi kesalahan pada server"));
   return response.json();
 }
@@ -2591,11 +2605,9 @@ export default function Index() {
     if (token) {
       try {
         await apiRequest("/auth/logout", token, { method: "POST" });
-      } catch {
-        // Local sign-out still proceeds. If the backend could not be reached,
-        // the account remains bound to this device until its server session expires.
-      }
+      } catch {}
     }
+    await supabase.auth.signOut({ scope: "local" }).catch(() => {});
     await clearToken();
     setToken(""); setUser(null); setDashboard(null); setRecords([]); setAuthState("signed_out");
   }, [token]);
@@ -2628,45 +2640,96 @@ export default function Index() {
     await loadApp(token);
   }, [token, loadApp]);
 
-  const exchange = useCallback(async (sessionId: string) => {
-    if (!sessionId || usedSessionIds.has(sessionId)) return;
-    usedSessionIds.add(sessionId); setAuthBusy(true); setAuthError("");
+  const finishSupabaseLogin = useCallback(async (accessToken?: string) => {
+    setAuthBusy(true);
+    setAuthError("");
     try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      const access_token = accessToken || sessionData.session?.access_token;
+      if (!access_token) throw new Error("Sesi Google tidak ditemukan.");
+
       const deviceId = await getOrCreateDeviceId();
-      const response = await fetch(apiUrl("/auth/session"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, device_id: deviceId }) });
-      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || "Google verification failed");
+      const response = await fetch(apiUrl("/auth/session"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ access_token, device_id: deviceId }),
+      });
+      if (!response.ok) {
+        throw new Error((await response.json().catch(() => null))?.detail || "Google verification failed");
+      }
+
       const data = await response.json();
       await saveToken(data.session_token);
-      setToken(data.session_token); setUser(data.user);
+      setToken(data.session_token);
+      setUser(data.user);
       await prepareSession(data.session_token, true);
+
       if (Platform.OS === "web") {
-        const cleanUrl = window.location.href.replace(/([?#&])session_id=[^&#]+/, "").replace(/[?&]$/, "");
-        window.history.replaceState(window.history.state, "", cleanUrl);
+        const clean = window.location.href.replace(/[?#].*$/, "");
+        window.history.replaceState(window.history.state, "", clean);
       }
     } catch (error) {
-      usedSessionIds.delete(sessionId);
       setAuthError(error instanceof Error ? error.message : "Google verification failed");
       setAuthState("signed_out");
-    } finally { setAuthBusy(false); }
+    } finally {
+      setAuthBusy(false);
+    }
   }, [prepareSession]);
 
   useEffect(() => {
     let mounted = true;
     let cleanup: (() => void) | undefined;
-    const handleUrl = (url: string) => { const id = sessionIdFromUrl(url); if (id && mounted) void exchange(id); };
+
+    const handleAuthUrl = async (url: string | null) => {
+      if (!url || !mounted) return;
+      try {
+        const parsed = new URL(url);
+        const params = new URLSearchParams(parsed.search);
+        const hash = parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash;
+        const hashParams = new URLSearchParams(hash);
+        const code = params.get("code");
+        const accessToken = hashParams.get("access_token") || params.get("access_token");
+        const refreshToken = hashParams.get("refresh_token") || params.get("refresh_token");
+
+        if (code) {
+          const { error } = await supabase.auth.exchangeCodeForSession(code);
+          if (error) throw error;
+        } else if (accessToken && refreshToken) {
+          const { error } = await supabase.auth.setSession({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+          });
+          if (error) throw error;
+        }
+
+        const { data } = await supabase.auth.getSession();
+        if (data.session) await finishSupabaseLogin(data.session.access_token);
+      } catch (error) {
+        setAuthError(error instanceof Error ? error.message : "Google verification failed");
+        setAuthState("signed_out");
+      }
+    };
+
     const setup = async () => {
       try {
         const initial = Platform.OS === "web" ? window.location.href : await Linking.getInitialURL();
-        const callbackSessionId = sessionIdFromUrl(initial);
-        if (callbackSessionId) handleUrl(initial || "");
-        else {
-          const existing = await readToken();
+        if (initial && /[?#&](?:code|access_token)=/.test(initial)) {
+          await handleAuthUrl(initial);
+        } else {
+          const { data, error } = await supabase.auth.getSession();
+          if (error) throw error;
           if (!mounted) return;
-          if (existing) await prepareSession(existing, true);
-          else setAuthState("signed_out");
+          if (data.session?.access_token) {
+            await finishSupabaseLogin(data.session.access_token);
+          } else {
+            await clearToken();
+            setAuthState("signed_out");
+          }
         }
+
         if (Platform.OS !== "web") {
-          const listener = Linking.addEventListener("url", (event) => handleUrl(event.url));
+          const listener = Linking.addEventListener("url", (event) => { void handleAuthUrl(event.url); });
           cleanup = () => listener.remove();
         }
       } catch (error) {
@@ -2678,10 +2741,14 @@ export default function Index() {
         setAuthState("signed_out");
       }
     };
+
     void setup();
-    const startupFallback = setTimeout(() => { if (mounted) setAuthState((current) => current === "loading" ? "signed_out" : current); }, 15000);
+    const startupFallback = setTimeout(() => {
+      if (mounted) setAuthState((current) => current === "loading" ? "signed_out" : current);
+    }, 15000);
+
     return () => { mounted = false; clearTimeout(startupFallback); cleanup?.(); };
-  }, [exchange, prepareSession]);
+  }, [finishSupabaseLogin]);
 
   useEffect(() => {
     const sub = AppState.addEventListener("change", (nextState) => {
@@ -2703,22 +2770,68 @@ export default function Index() {
     return () => sub.remove();
   }, [authState, token]);
 
+  const handleOAuthCallback = async (url: string) => {
+    const parsed = new URL(url);
+    const params = new URLSearchParams(parsed.search);
+    const hash = parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash;
+    const hashParams = new URLSearchParams(hash);
+    const code = params.get("code");
+    const accessToken = hashParams.get("access_token") || params.get("access_token");
+    const refreshToken = hashParams.get("refresh_token") || params.get("refresh_token");
+
+    if (code) {
+      const { error } = await supabase.auth.exchangeCodeForSession(code);
+      if (error) throw error;
+    } else if (accessToken && refreshToken) {
+      const { error } = await supabase.auth.setSession({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+      });
+      if (error) throw error;
+    } else {
+      throw new Error("Callback Google tidak membawa sesi login.");
+    }
+
+    const { data, error } = await supabase.auth.getSession();
+    if (error) throw error;
+    if (!data.session) throw new Error("Sesi Google tidak ditemukan.");
+    await finishSupabaseLogin(data.session.access_token);
+  };
+
   const login = async () => {
-    setAuthBusy(true); setAuthError("");
+    setAuthBusy(true);
+    setAuthError("");
     try {
-      const redirectUrl = Platform.OS === "web" ? `${window.location.origin}/` : Linking.createURL("");
-      const authUrl = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
-      if (Platform.OS === "web") window.location.href = authUrl;
-      else {
-        let linkedUrl: string | null = null;
-        const listener = Linking.addEventListener("url", (event) => { linkedUrl = event.url; });
-        const result = await WebBrowser.openAuthSessionAsync(authUrl, redirectUrl);
-        listener.remove();
-        const callback = result.type === "success" ? result.url : linkedUrl || await Linking.getInitialURL();
-        const id = sessionIdFromUrl(callback);
-        if (id) await exchange(id); else setAuthError("Google sign-in was cancelled.");
+      const redirectUrl = Platform.OS === "web"
+        ? window.location.origin
+        : Linking.createURL("auth/callback");
+
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: redirectUrl,
+          skipBrowserRedirect: Platform.OS !== "web",
+        },
+      });
+      if (error) throw error;
+
+      if (Platform.OS === "web") {
+        if (!data.url) throw new Error("URL login Google tidak tersedia.");
+        window.location.assign(data.url);
+        return;
       }
-    } catch (error) { setAuthError(error instanceof Error ? error.message : "Could not open Google sign-in"); setAuthBusy(false); }
+
+      const result = await WebBrowser.openAuthSessionAsync(data.url, redirectUrl);
+      if (result.type !== "success") {
+        setAuthError("Google sign-in dibatalkan.");
+        setAuthBusy(false);
+        return;
+      }
+      await handleOAuthCallback(result.url);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Could not open Google sign-in");
+      setAuthBusy(false);
+    }
   };
 
   const refresh = async () => { if (!token || authState !== "signed_in") return; try { const [home, history] = await Promise.all([apiRequest<Dashboard>("/dashboard", token), apiRequest<RecordItem[]>("/attendance", token)]); setDashboard(home); setRecords(history); } catch (err) { if (err instanceof Error && err.message.toLowerCase().includes("password")) setAuthState("locked"); } };
