@@ -641,7 +641,7 @@ def clean(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 class SessionRequest(BaseModel):
-    session_id: str
+    access_token: str = Field(min_length=20, max_length=4096)
     device_id: str = Field(min_length=12, max_length=160)
 
 
@@ -823,31 +823,107 @@ def verify_password(password: str, stored: Optional[str]) -> bool:
     except Exception:
         return False
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://tzgpmpiavwnealdtjnub.supabase.co").rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip()
+
+
+async def get_supabase_user(access_token: str) -> Dict[str, Any]:
+    if not SUPABASE_ANON_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_ANON_KEY belum dikonfigurasi di backend")
+    try:
+        async with httpx.AsyncClient(timeout=12) as http_client:
+            response = await http_client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {access_token}",
+                },
+            )
+    except Exception as exc:
+        logger.exception("Supabase Auth verification failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Authentication service unavailable") from exc
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Sesi login tidak valid atau sudah berakhir")
+
+    data = response.json()
+    user = data.get("user") if isinstance(data, dict) else None
+    if not isinstance(user, dict) or not user.get("id") or not user.get("email"):
+        raise HTTPException(status_code=401, detail="Identitas pengguna tidak ditemukan")
+    return user
+
+
 async def get_session_user(request: Request, require_unlock: bool = False, touch: bool = False) -> tuple[Dict[str, Any], Dict[str, Any]]:
     header = request.headers.get("authorization", "")
     if not header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authentication required")
     token = header[7:].strip()
-    if len(token) < 20 or len(token) > 2048 or any(ch.isspace() for ch in token):
+    if len(token) < 20 or len(token) > 4096 or any(ch.isspace() for ch in token):
         raise HTTPException(status_code=401, detail="Session tidak valid")
+
+    supabase_user = await get_supabase_user(token)
+    supabase_user_id = str(supabase_user["id"])
+    email = str(supabase_user.get("email", "")).strip().lower()
+
     session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
-    if not session:
-        raise HTTPException(status_code=401, detail="Session expired")
-    expires_at = session.get("expires_at")
-    if isinstance(expires_at, datetime):
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at <= now_utc():
-            raise HTTPException(status_code=401, detail="Session expired")
-    user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+    user = None
+    if session:
+        user = await db.users.find_one({"user_id": session.get("user_id")}, {"_id": 0})
+
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        user = await db.users.find_one(
+            {"$or": [{"supabase_user_id": supabase_user_id}, {"email": email}]},
+            {"_id": 0},
+        )
+
+    if not user:
+        raise HTTPException(status_code=401, detail="User profile belum terdaftar")
+
+    if user.get("supabase_user_id") != supabase_user_id:
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"supabase_user_id": supabase_user_id, "updated_at": now_utc()}},
+        )
+        user["supabase_user_id"] = supabase_user_id
+
     if user.get("account_status", "approved") != "approved":
-        raise HTTPException(status_code=403, detail="Account is waiting for admin approval" if user.get("account_status") == "pending" else "Account access was rejected")
+        raise HTTPException(
+            status_code=403,
+            detail="Account is waiting for admin approval"
+            if user.get("account_status") == "pending"
+            else "Account access was rejected",
+        )
+
+    if not session:
+        previous_session = await db.user_sessions.find_one(
+            {"user_id": user["user_id"]},
+            {"_id": 0},
+            sort=[("last_activity_at", -1), ("created_at", -1)],
+        )
+        session = {
+            "session_token": token,
+            "user_id": user["user_id"],
+            "device_id": user.get("active_device_id"),
+            "created_at": now_utc(),
+            "expires_at": now_utc() + timedelta(days=7),
+            "unlocked_until": (previous_session or {}).get("unlocked_until"),
+            "last_activity_at": (previous_session or {}).get("last_activity_at"),
+        }
+        await db.user_sessions.update_one(
+            {"session_token": token},
+            {"$set": session},
+            upsert=True,
+        )
+    else:
+        expires_at = session.get("expires_at")
+        if isinstance(expires_at, datetime) and as_utc(expires_at) <= now_utc():
+            raise HTTPException(status_code=401, detail="Session expired")
+
     active_device_id = user.get("active_device_id")
     session_device_id = session.get("device_id")
     if active_device_id and session_device_id != active_device_id:
         raise HTTPException(status_code=401, detail="This account is signed in on another device")
+
     if require_unlock:
         unlocked_until = session.get("unlocked_until")
         if not isinstance(unlocked_until, datetime):
@@ -857,8 +933,12 @@ async def get_session_user(request: Request, require_unlock: bool = False, touch
             raise HTTPException(status_code=423, detail="Password required")
         if touch:
             next_unlock = now_utc() + timedelta(minutes=SESSION_IDLE_MINUTES)
-            await db.user_sessions.update_one({"session_token": token}, {"$set": {"unlocked_until": next_unlock, "last_activity_at": now_utc()}})
+            await db.user_sessions.update_one(
+                {"session_token": token},
+                {"$set": {"unlocked_until": next_unlock, "last_activity_at": now_utc()}},
+            )
             session["unlocked_until"] = next_unlock
+
     return clean(user), clean(session)
 
 async def get_current_user(request: Request) -> Dict[str, Any]:
@@ -1354,39 +1434,45 @@ async def root() -> Dict[str, str]:
 
 @api_router.post("/auth/session", response_model=SessionResponse)
 async def create_session(payload: SessionRequest) -> SessionResponse:
-    await enforce_device_auth_rate_limit(payload.device_id.strip())
-    try:
-        async with httpx.AsyncClient(timeout=15) as http_client:
-            response = await http_client.get(
-                "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-                headers={"X-Session-ID": payload.session_id},
-            )
-        if response.status_code != 200:
-            raise HTTPException(status_code=401, detail="Google verification failed")
-        data = response.json()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Google session exchange failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Authentication service unavailable") from exc
+    device_id = payload.device_id.strip()
+    await enforce_device_auth_rate_limit(device_id)
 
-    identity = data.get("user", data)
-    email = identity.get("email")
+    identity = await get_supabase_user(payload.access_token.strip())
+    email = str(identity.get("email", "")).strip()
     if not email:
         raise HTTPException(status_code=401, detail="Verified email was not returned")
+
     email_lower = email.lower()
     bootstrap_email = os.getenv("PKUCITY_ADMIN_EMAIL", "").strip().lower()
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    supabase_user_id = str(identity["id"])
+    metadata = identity.get("user_metadata") or {}
+    name = (
+        metadata.get("full_name")
+        or metadata.get("name")
+        or identity.get("user_metadata", {}).get("full_name")
+        or email.split("@")[0]
+    )
+    picture = (
+        metadata.get("avatar_url")
+        or metadata.get("picture")
+        or metadata.get("avatar")
+    )
     is_bootstrap_admin = bool(bootstrap_email and email_lower == bootstrap_email)
+
+    existing = await db.users.find_one(
+        {"$or": [{"supabase_user_id": supabase_user_id}, {"email": email}]},
+        {"_id": 0},
+    )
 
     if not existing:
         user_doc = {
             "user_id": f"user_{uuid.uuid4().hex[:12]}",
+            "supabase_user_id": supabase_user_id,
             "email": email,
-            "name": identity.get("name") or email.split("@")[0],
-            "picture": identity.get("picture") or identity.get("avatar"),
+            "name": name,
+            "picture": picture,
             "role": "admin" if is_bootstrap_admin else "employee",
-            "email_verified": True,
+            "email_verified": bool(identity.get("email_confirmed_at") or identity.get("confirmed_at")),
             "full_name": None,
             "department": None,
             "profile_complete": False,
@@ -1401,8 +1487,10 @@ async def create_session(payload: SessionRequest) -> SessionResponse:
         existing = user_doc
     else:
         updates: Dict[str, Any] = {
-            "picture": identity.get("picture") or identity.get("avatar") or existing.get("picture"),
-            "email_verified": True,
+            "supabase_user_id": supabase_user_id,
+            "picture": picture or existing.get("picture"),
+            "name": name or existing.get("name") or email.split("@")[0],
+            "email_verified": bool(identity.get("email_confirmed_at") or identity.get("confirmed_at") or existing.get("email_verified", False)),
             "updated_at": now_utc(),
         }
         if is_bootstrap_admin:
@@ -1416,16 +1504,9 @@ async def create_session(payload: SessionRequest) -> SessionResponse:
     if status == "rejected":
         raise HTTPException(status_code=403, detail="Your account access was rejected. Please contact an admin.")
 
-    session_token = data.get("session_token")
-    if not session_token:
-        raise HTTPException(status_code=401, detail="Authentication token was not returned")
-
-    device_id = payload.device_id.strip()
     user_id = existing["user_id"]
     now = now_utc()
 
-    # One account = one active device. A stale/expired session does not permanently
-    # lock the account, but an active session on another device must be logged out first.
     active_device_id = existing.get("active_device_id")
     if active_device_id and active_device_id != device_id:
         active_session = await db.user_sessions.find_one(
@@ -1459,7 +1540,7 @@ async def create_session(payload: SessionRequest) -> SessionResponse:
             detail="This account is already signed in on another device. Sign out from that device first.",
         )
 
-    # Keep a single server session for the account. Re-login on the same device is allowed.
+    session_token = payload.access_token.strip()
     await db.user_sessions.delete_many({"user_id": user_id, "session_token": {"$ne": session_token}})
     await db.user_sessions.update_one(
         {"session_token": session_token},
@@ -1474,6 +1555,7 @@ async def create_session(payload: SessionRequest) -> SessionResponse:
         }},
         upsert=True,
     )
+
     existing["active_device_id"] = device_id
     existing["active_device_since"] = now
     public = clean(existing)
