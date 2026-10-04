@@ -43,14 +43,9 @@ app = FastAPI(title="PKUCity Attendance API")
 api_router = APIRouter(prefix="/api")
 logger = logging.getLogger("pkucity")
 
-# Emergent-managed push notifications relay
-PUSH_BASE_URL = "https://integrations.emergentagent.com"
-PUSH_KEY = os.environ.get("EMERGENT_PUSH_KEY", "placeholder")
-_push_client = httpx.AsyncClient(
-    base_url=PUSH_BASE_URL,
-    headers={"X-Push-Key": PUSH_KEY},
-    timeout=10.0,
-)
+# Expo Push Service notifications
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+_push_client = httpx.AsyncClient(timeout=10.0)
 
 
 class RegisterPushBody(BaseModel):
@@ -62,19 +57,37 @@ class RegisterPushBody(BaseModel):
 async def send_push(recipients: List[str], data: Dict[str, Any], idempotency_key: Optional[str] = None) -> None:
     if not recipients:
         return
-    if len(recipients) > 100:
-        raise ValueError("max 100 recipients per /trigger call; chunk before sending")
     if "title" not in data or "message" not in data:
         raise ValueError("data must include title and message")
-    payload: Dict[str, Any] = {"recipients": recipients, "data": data}
-    if idempotency_key:
-        payload["$idempotency_key"] = idempotency_key
-    resp = await _push_client.post("/api/v1/push/trigger", json=payload)
-    if resp.status_code == 401:
-        raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
-    if resp.status_code >= 500:
-        raise HTTPException(502, "Push provider unavailable")
-    resp.raise_for_status()
+
+    tokens = await db.push_tokens.find(
+        {"user_id": {"$in": recipients}, "is_active": True},
+        {"_id": 0, "device_token": 1},
+    ).to_list(100)
+    messages = []
+    for item in tokens:
+        token = item.get("device_token")
+        if token:
+            messages.append({
+                "to": token,
+                "title": data["title"],
+                "body": data["message"],
+                "data": {k: v for k, v in data.items() if k not in {"title", "message"}},
+                "sound": "default",
+            })
+
+    for offset in range(0, len(messages), 100):
+        batch = messages[offset:offset + 100]
+        response = await _push_client.post(EXPO_PUSH_URL, json=batch)
+        response.raise_for_status()
+        result = response.json()
+        for ticket, message in zip(result.get("data", []), batch):
+            details = ticket.get("details", {}) if isinstance(ticket, dict) else {}
+            if details.get("error") == "DeviceNotRegistered":
+                await db.push_tokens.update_many(
+                    {"device_token": message["to"]},
+                    {"$set": {"is_active": False}},
+                )
 
 
 def now_utc() -> datetime:
@@ -137,7 +150,7 @@ async def enforce_sensitive_rate_limit(
     limit: int,
     window_seconds: int,
 ) -> None:
-    """Small Mongo-backed limiter for sensitive employee actions."""
+    """Small database-backed limiter for sensitive employee actions."""
     now = now_utc()
     cutoff = now - timedelta(seconds=window_seconds)
     count = await db.security_rate_events.count_documents({
